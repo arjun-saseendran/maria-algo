@@ -4,7 +4,7 @@ import http from "http";
 import { Server } from "socket.io";
 import cors from "cors";
 import cron from "node-cron";
-import mongoose from "mongoose"; // 🚨 ADDED for flexible schema
+import mongoose from "mongoose";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 import { connectDatabases, getCondorDB } from "./config/db.js";
@@ -24,8 +24,6 @@ import { resetDailyState, tradeState } from "./state/tradeState.js";
 import { scanAndSyncOrders } from "./services/orderMonitorService.js";
 import { loadTokenFromDisk } from "./services/kiteService.js";
 import { sendTelegramAlert } from "./services/telegramService.js";
-
-// 🚨 CHANGED: Import Master Data Feed instead of individual sockets
 import { initMasterDataFeed }  from "./services/masterDataFeed.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -116,10 +114,10 @@ app.get("/api/history", async (req, res) => {
 
     const condorConn = getCondorDB();
     
-    // 🚨 CHANGED: Using a loose schema to prevent crashes on missing fields
+    // 🚨 FIXED BUG: Now strictly pointing to CondorTradePerformance
     const CondorPerf = condorConn.model(
-      "TradePerformance",
-      new mongoose.Schema({}, { strict: false, collection: 'tradeperformances' })
+      "CondorTradePerformance",
+      new mongoose.Schema({}, { strict: false, collection: 'condortradeperformances' })
     );
     
     const condorHistory = await CondorPerf.find()
@@ -176,7 +174,6 @@ const start = async () => {
       if (process.env.FYERS_ACCESS_TOKEN) {
         console.log("📡 Fyers token found — starting Master Data Feed...");
         
-        // 🚨 CHANGED: Single initialization for both strategies
         await initMasterDataFeed(io);
         
       } else {

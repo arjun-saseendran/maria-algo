@@ -7,4 +7,5 @@ const tradePerformanceSchema = new mongoose.Schema({
   notes: { type: String }
 }, { timestamps: true });
 
-export default mongoose.model('TradePerformance', tradePerformanceSchema);
+// 🚨 FIXED: The model is now uniquely named 'CondorTradePerformance'
+export default mongoose.models.CondorTradePerformance || mongoose.model('CondorTradePerformance', tradePerformanceSchema);

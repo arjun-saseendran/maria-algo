@@ -2,7 +2,7 @@ import express from 'express';
 import { scanAndSyncOrders } from '../services/orderMonitorService.js';
 import ActiveTrade from '../models/activeTradeModel.js';
 // 🚨 FIXED: Now imports from the Fyers Ticker
-import { lastPrices } from '../services/fyersTickerService.js'; 
+import { lastPrices } from '../services/masterDataFeed.js'; 
 import { getKiteInstance } from '../services/kiteService.js'; 
 import { sendTelegramAlert } from '../services/telegramService.js';
 // 🚨 NEW: Import mapper for price lookups
