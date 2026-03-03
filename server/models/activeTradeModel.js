@@ -1,57 +1,41 @@
 import mongoose from 'mongoose';
 
 const activeTradeSchema = new mongoose.Schema({
-  index: { type: String, required: true }, // NIFTY or SENSEX
+  index: { type: String, required: true },
   status: { 
     type: String, 
     default: 'ACTIVE', 
-    // Added 'COMPLETED' to ensure validation passes when finalizing trades
     enum: ['ACTIVE', 'MANUAL_OVERRIDE', 'EXITING', 'EXITED', 'FAILED_EXIT', 'COMPLETED'] 
   },
-  
-  // --- Identifies if this is a 4-leg IC or a 2-leg directional spread ---
   tradeType: { 
     type: String, 
     enum: ['IRON_CONDOR', 'CALL_SPREAD', 'PUT_SPREAD'], 
     required: true 
   },
-  
-  // --- DYNAMIC STATE VARIABLES ---
   isIronButterfly: { type: Boolean, default: false }, 
-  bufferPremium: { type: Number, default: 0 }, // Holds booked profits from trending rolls!
+  bufferPremium: { type: Number, default: 0 }, 
   lotSize: { type: Number, required: true }, 
-  
-  // --- STRIKES ---
   callSellStrike: { type: Number },
   putSellStrike: { type: Number },
-  
-  // --- PREMIUMS ---
   callSpreadEntryPremium: { type: Number, default: 0 },
   putSpreadEntryPremium: { type: Number, default: 0 },
   totalEntryPremium: { type: Number, required: true },
-  
-  // --- ALERT TRACKERS ---
   alertsSent: {
     call70Decay: { type: Boolean, default: false },
     put70Decay: { type: Boolean, default: false },
     firefightAlert: { type: Boolean, default: false }
   },
-
-  // --- KITE SYMBOLS & TOKENS ---
   symbols: {
-    callSell: { type: String },
-    callBuy: { type: String },
-    putSell: { type: String },
-    putBuy: { type: String }
+    callSell: String, callBuy: String, putSell: String, putBuy: String
   },
   tokens: {
     spotIndex: { type: Number, required: true },
-    callSell: { type: Number },
-    callBuy: { type: Number },
-    putSell: { type: Number },
-    putBuy: { type: Number }
+    callSell: Number, callBuy: Number, putSell: Number, putBuy: Number
   }
 }, { timestamps: true });
 
-const ActiveTrade = mongoose.model('ActiveTrade', activeTradeSchema);
+// --- THE FIX: PREVENTS OVERWRITEMODELERROR ---
+// This checks if the model is already in Mongoose's internal cache
+const ActiveTrade = mongoose.models.ActiveTrade || mongoose.model('ActiveTrade', activeTradeSchema);
+
 export default ActiveTrade;
