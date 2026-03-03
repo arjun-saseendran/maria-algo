@@ -44,28 +44,22 @@ io.on("connection", (socket) => {
   socket.on("market_tick", (data) => { if (data?.price) lastTLLTP = data.price; });
 });
 
-// ─── Endpoints ────────────────────────────────────────────────────────────────
+// ─── API Routes ───────────────────────────────────────────────────────────────
 app.use("/api/auth", authRoutes);
-app.use("/api/trades",    tradeRoutes);
-app.use("/api/options",   optionsRoutes);
+app.use("/api/trades", tradeRoutes);
+app.use("/api/options", optionsRoutes);
 app.use("/api/positions", positionRoutes);
 
-// Dashboard: Iron Condor Live Positions
+// 1. Dashboard: Iron Condor Live Positions
 app.get("/api/condor/positions", async (req, res) => {
   try {
     const activeTrade = await ActiveTrade.findOne({ status: "ACTIVE" });
     if (!activeTrade) return res.json([]);
-
     const idx = activeTrade.index;
     const getLtp = (sym) => sym ? lastPrices[kiteToFyersSymbol(sym, idx)] || 0 : 0;
-
-    const currentCallNet = activeTrade.symbols.callSell 
-        ? Math.abs(getLtp(activeTrade.symbols.callSell) - getLtp(activeTrade.symbols.callBuy)) : 0;
-    const currentPutNet = activeTrade.symbols.putSell 
-        ? Math.abs(getLtp(activeTrade.symbols.putSell) - getLtp(activeTrade.symbols.putBuy)) : 0;
-
-    const totalPnL = ((activeTrade.callSpreadEntryPremium - currentCallNet) + 
-                      (activeTrade.putSpreadEntryPremium - currentPutNet)) * activeTrade.quantity;
+    const currentCallNet = activeTrade.symbols.callSell ? Math.abs(getLtp(activeTrade.symbols.callSell) - getLtp(activeTrade.symbols.callBuy)) : 0;
+    const currentPutNet = activeTrade.symbols.putSell ? Math.abs(getLtp(activeTrade.symbols.putSell) - getLtp(activeTrade.symbols.putBuy)) : 0;
+    const totalPnL = ((activeTrade.callSpreadEntryPremium - currentCallNet) + (activeTrade.putSpreadEntryPremium - currentPutNet)) * activeTrade.quantity;
 
     res.json([{
       index: activeTrade.index,
@@ -77,7 +71,7 @@ app.get("/api/condor/positions", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Strategy Execution
+// 2. Multi-Leg strategy execution
 app.post("/api/trades/execute-basket", async (req, res) => {
   try {
     const { symbol, legs } = req.body;
@@ -86,17 +80,17 @@ app.post("/api/trades/execute-basket", async (req, res) => {
       return kite.placeOrder("regular", {
         exchange: symbol === "SENSEX" ? "BFO" : "NFO",
         tradingsymbol: `${symbol}26MAR${leg.strike}${leg.optionType}`,
-        transaction_type: leg.type === kite.TRANSACTION_TYPE_BUY,
+        transaction_type: leg.type === "BUY" ? kite.TRANSACTION_TYPE_BUY : kite.TRANSACTION_TYPE_SELL,
         quantity: leg.qty,
-        order_type: "MARKET",
-        product: "MIS"
+        order_type: kite.ORDER_TYPE_MARKET,
+        product: kite.PRODUCT_MIS
       });
     }));
     res.json({ orderIds: results.map(r => r.order_id) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Traffic Light Status
+// 3. Traffic Light dashboard status
 app.get("/api/traffic/status", (req, res) => {
   let livePnL = 0;
   if (tradeState?.tradeActive && tradeState?.entryPrice && lastTLLTP > 0) {
@@ -112,49 +106,35 @@ app.get("/api/traffic/status", (req, res) => {
   });
 });
 
-// Combined History (FIXED: Defined model outside route logic)
+// 4. Combined history (FIXED: defined model outside to prevent crash)
 let CondorPerfModel; 
 app.get("/api/history", async (req, res) => {
   try {
     const trafficHistory = await TrafficTradePerformance.find().sort({ createdAt: -1 }).limit(10);
-    
-    // Initialize model once if not already done
     if (!CondorPerfModel) {
       const condorConn = getCondorDB();
       CondorPerfModel = condorConn.model("CondorTradePerformance", new mongoose.Schema({}, { strict: false, collection: 'condortradeperformances' }));
     }
-
     const condorHistory = await CondorPerfModel.find().sort({ createdAt: -1 }).limit(10);
-
-    const combined = [...trafficHistory, ...condorHistory]
-      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-      .slice(0, 10).map((h) => ({
-        symbol: h.index || h.symbol, 
-        exitReason: h.exitReason, 
-        pnl: h.realizedPnL || h.pnl,
+    const combined = [...trafficHistory, ...condorHistory].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 10).map((h) => ({
+        symbol: h.index || h.symbol, exitReason: h.exitReason, pnl: h.realizedPnL || h.pnl,
         strategy: h.notes?.includes("Iron Condor") || h.callSpreadEntryPremium ? "IRON_CONDOR" : "TRAFFIC_LIGHT",
-        createdAt: h.createdAt
       }));
     res.json(combined);
-  } catch (err) { 
-    console.error("❌ History Error:", err.message);
-    res.status(500).json({ error: "History sync failed" }); 
-  }
+  } catch (err) { res.status(500).json({ error: "History sync failed" }); }
 });
 
-// ─── Startup ──────────────────────────────────────────────────────────────────
 const start = async () => {
   try {
     await connectDatabases();
     await loadTokenFromDisk(); 
-
     const PORT = process.env.PORT || 3000;
     server.listen(PORT, async () => {
       console.log(`🚀 Maria Algo Server Online · port ${PORT}`);
       if (process.env.FYERS_ACCESS_TOKEN) await initMasterDataFeed(io);
       setInterval(async () => { try { await scanAndSyncOrders(); } catch (err) {} }, 60000);
     });
-  } catch (err) { console.error("Fatal:", err); process.exit(1); }
+  } catch (err) { process.exit(1); }
 };
 
 start();
