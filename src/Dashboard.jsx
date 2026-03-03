@@ -74,7 +74,7 @@ const Dashboard = () => {
             
 
           </div>
-          <h1 className="text-2xl font-bold tracking-tight">mariaAlgo <span className="text-emerald-500 text-sm font-normal ml-2">v2.0</span></h1>
+          <h1 className="text-2xl font-bold tracking-tight">MARIA{'     '}<span className='text-emerald-500'>ALGO</span>  <span className="text-emerald-500 text-sm font-normal ml-2">v3.0</span></h1>
         </div>
         <div className="flex gap-4">
           <div className={`px-3 py-1 rounded-full text-xs font-bold flex items-center gap-2 ${status.condor === 'LIVE' ? 'bg-emerald-500/10 text-emerald-500 border border-emerald-500/50' : 'bg-red-500/10 text-red-500'}`}>
