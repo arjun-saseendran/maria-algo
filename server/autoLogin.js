@@ -30,7 +30,7 @@ function validateEnv() {
     }
 }
 
-// ─── Native TOTP (RFC 6238) ───────────────────────────────────────────────────
+// ─── Native TOTP (RFC 6238) — No external library needed ─────────────────────
 function base32Decode(base32) {
     const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     const clean = base32.replace(/[^A-Z2-7]/gi, "").toUpperCase();
@@ -51,11 +51,15 @@ function generateTotp(secret, digits = 6, period = 30) {
     const key = base32Decode(secret);
     const counter = Math.floor(Date.now() / 1000 / period);
 
+    // Counter as 8-byte big-endian buffer
     const counterBuf = Buffer.alloc(8);
     counterBuf.writeUInt32BE(Math.floor(counter / 0x100000000), 0);
     counterBuf.writeUInt32BE(counter >>> 0, 4);
 
+    // HMAC-SHA1
     const hmac = crypto.createHmac("sha1", key).update(counterBuf).digest();
+
+    // Dynamic truncation
     const offset = hmac[hmac.length - 1] & 0x0f;
     const code =
         ((hmac[offset] & 0x7f) << 24) |
@@ -66,30 +70,23 @@ function generateTotp(secret, digits = 6, period = 30) {
     return String(code % Math.pow(10, digits)).padStart(digits, "0");
 }
 
-// ─── Base64 encode PIN ────────────────────────────────────────────────────────
+// ─── Base64 encode PIN (required by Fyers) ─────────────────────────────────
 function hashPin(pin) {
     return Buffer.from(pin.toString()).toString("base64");
 }
 
-// ─── Extract auth_code from redirect URL ─────────────────────────────────────
+// ─── Safe auth_code extractor ─────────────────────────────────────────────────
 function extractAuthCode(url) {
     try {
         const parsed = new URL(url);
         const code = parsed.searchParams.get("auth_code");
         if (code) return code;
-    } catch { /* fallthrough */ }
+    } catch {
+        // fallthrough
+    }
     const match = url.match(/[?&]auth_code=([^&]+)/);
     if (match) return match[1];
-    throw new Error(`auth_code not found in URL: ${url}`);
-}
-
-// ─── Decode JWT payload ───────────────────────────────────────────────────────
-function decodeJwt(token) {
-    try {
-        return JSON.parse(Buffer.from(token.split(".")[1], "base64").toString());
-    } catch {
-        return null;
-    }
+    throw new Error(`auth_code not found in redirect URL: ${url}`);
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -103,7 +100,9 @@ async function generateFyersToken() {
         "https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
         { fy_id: Buffer.from(FYERS_FY_ID).toString("base64"), app_id: "2" }
     );
-    if (res1.data.s !== "ok") throw new Error(`Step 1 Failed: ${JSON.stringify(res1.data)}`);
+    if (res1.data.s !== "ok") {
+        throw new Error(`Step 1 Failed: ${JSON.stringify(res1.data)}`);
+    }
     let requestKey = res1.data.request_key;
     console.log("✅ Step 1 OK — request_key received.");
 
@@ -116,7 +115,9 @@ async function generateFyersToken() {
         "https://api-t2.fyers.in/vagator/v2/verify_otp",
         { request_key: requestKey, otp: currentTotp }
     );
-    if (res2.data.s !== "ok") throw new Error(`Step 2 Failed: ${JSON.stringify(res2.data)}`);
+    if (res2.data.s !== "ok") {
+        throw new Error(`Step 2 Failed: ${JSON.stringify(res2.data)}`);
+    }
     requestKey = res2.data.request_key;
     console.log("✅ Step 2 OK — TOTP verified.");
 
@@ -130,13 +131,15 @@ async function generateFyersToken() {
             identifier: hashPin(FYERS_PIN),
         }
     );
-    if (res3.data.s !== "ok") throw new Error(`Step 3 Failed: ${JSON.stringify(res3.data)}`);
+    if (res3.data.s !== "ok") {
+        throw new Error(`Step 3 Failed: ${JSON.stringify(res3.data)}`);
+    }
     const ssoToken = res3.data.data?.access_token;
-    if (!ssoToken) throw new Error("Step 3: access_token missing.");
+    if (!ssoToken) throw new Error("Step 3: access_token missing from response.");
     console.log("✅ Step 3 OK — SSO token received.");
 
-    // STEP 4: Get token from Fyers
-    console.log("📤 Step 4: Fetching auth token...");
+    // STEP 4: Get auth code
+    console.log("📤 Step 4: Fetching auth code...");
     const appIdPrefix = FYERS_APP_ID.includes("-")
         ? FYERS_APP_ID.split("-")[0]
         : FYERS_APP_ID;
@@ -158,63 +161,54 @@ async function generateFyersToken() {
         {
             headers: { Authorization: `Bearer ${ssoToken}` },
             maxRedirects: 0,
-            validateStatus: (status) => status >= 200 && status < 400,
+            validateStatus: (status) => status === 200 || status === 308,
         }
     );
 
-    if (res4.data?.s !== "ok") {
-        throw new Error(`Step 4 Failed: ${JSON.stringify(res4.data)}`);
-    }
-
-    let accessToken;
-
-    if (res4.data?.Url) {
-        // ─────────────────────────────────────────────────────────────────────
-        // FLOW A: Fyers returns Url with auth_code (sub="auth_code")
-        // Must exchange via generate_access_token → gets final access token
-        // ─────────────────────────────────────────────────────────────────────
-        console.log("📎 Flow A — exchanging auth_code for access token...");
-        const authCode = extractAuthCode(res4.data.Url);
-
-        const fyers = new FyersAPI();
-        fyers.setAppId(FYERS_APP_ID);
-        fyers.setRedirectUrl(FYERS_REDIRECT_URI);
-
-        const tokenResponse = await fyers.generate_access_token({
-            secret_key: FYERS_SECRET_ID,
-            auth_code: authCode,
-        });
-
-        if (tokenResponse.s !== "ok") {
-            throw new Error(`Flow A token exchange failed: ${JSON.stringify(tokenResponse)}`);
+    if (!res4.data?.Url) {
+        // Trap the First-Time Consent requirement
+        if (res4.data?.data?.auth && res4.data?.data?.appName) {
+            const consentUrl = `https://api-t1.fyers.in/api/v3/generate-authcode?client_id=${FYERS_APP_ID}&redirect_uri=${encodeURIComponent(FYERS_REDIRECT_URI)}&response_type=code&state=None`;
+            
+            throw new Error(
+                `\n❌ Step 4 Failed: User Consent Required.\n` +
+                `Fyers is waiting for you to approve "${res4.data.data.appName}".\n\n` +
+                `🚨 ACTION REQUIRED:\n` +
+                `1. Copy and paste this URL into a web browser:\n` +
+                `   ${consentUrl}\n` +
+                `2. Log in manually and click "Accept" or "Grant".\n` +
+                `3. Once it redirects to your callback URL, you can close the browser and run this script again.\n`
+            );
         }
 
-        accessToken = tokenResponse.access_token;
+        // Standard error trap
+        throw new Error(
+            `\n❌ Step 4 Failed: Redirect URL missing.\nResponse: ${JSON.stringify(res4.data)}\n` +
+            `→ Verify that FYERS_REDIRECT_URI exactly matches what is set in your Fyers app dashboard.`
+        );
+    }
+    
+    const authCode = extractAuthCode(res4.data.Url);
+    console.log("✅ Step 4 OK — Auth code extracted.");
 
-    } else if (res4.data?.data?.auth) {
-        // ─────────────────────────────────────────────────────────────────────
-        // FLOW B: Fyers returns auth JWT directly (sub="access_token")
-        // This IS the final access token — save it as bare JWT just like
-        // the working Traffic Light app does (no APPID prefix needed)
-        // ─────────────────────────────────────────────────────────────────────
-        console.log("📎 Flow B — auth JWT is the final access token.");
-        const authJwt = res4.data.data.auth;
-        const claims = decodeJwt(authJwt);
-        console.log(`🔍 JWT sub="${claims?.sub}" appType=${claims?.appType} exp=${new Date((claims?.exp || 0) * 1000).toISOString()}`);
+    // STEP 5: Generate access token
+    console.log("📤 Step 5: Generating access token...");
+    const fyers = new FyersAPI();
+    fyers.setAppId(FYERS_APP_ID);
+    fyers.setRedirectUrl(FYERS_REDIRECT_URI);
 
-        // Fyers API requires APPID:JWT format — prefix the JWT with the app ID
-        accessToken = authJwt; // Flow B: bare JWT is the final token
+    const tokenResponse = await fyers.generate_access_token({
+        secret_key: FYERS_SECRET_ID,
+        auth_code: authCode,
+    });
 
-    } else {
-        throw new Error(`Step 4 Failed: Unexpected response.\n${JSON.stringify(res4.data)}`);
+    if (tokenResponse.s !== "ok") {
+        throw new Error(`Step 5 Failed: ${JSON.stringify(tokenResponse)}`);
     }
 
-    console.log("✅ Step 4 OK — Access token ready.");
-
-    // STEP 5: Token confirmed via JWT claims — save directly
-    updateEnvFile("FYERS_ACCESS_TOKEN", accessToken);
-    console.log("🎉 Fyers headless login complete! Token saved to .env");
-    return accessToken;
+    console.log("✅ Access token retrieved successfully!");
+    updateEnvFile("FYERS_ACCESS_TOKEN", tokenResponse.access_token);
+    return tokenResponse.access_token;
 }
 
 // ─── Save token to .env ───────────────────────────────────────────────────────
@@ -235,11 +229,12 @@ function updateEnvFile(key, value) {
 
 // ─── Run ──────────────────────────────────────────────────────────────────────
 generateFyersToken().catch((error) => {
-    console.error("\n❌ Headless Login Failed:");
     if (error.response) {
+        console.error("\n❌ Headless Login Failed:");
         console.error("HTTP Error Status:", error.response.status);
         console.error(JSON.stringify(error.response.data, null, 2));
     } else {
+        // Output custom trapped errors cleanly without the generic header
         console.error(error.message);
     }
     process.exit(1);

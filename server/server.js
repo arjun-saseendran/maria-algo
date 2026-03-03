@@ -149,7 +149,7 @@ cron.schedule("0 9 * * 1-5", () => resetDailyState(), {
 const start = async () => {
   try {
     await connectDatabases();
-    loadTokenFromDisk();
+    await loadTokenFromDisk();
 
     const dateKey = getISTDate();
     const dailyRecord = await DailyStatus.findOne({ date: dateKey });

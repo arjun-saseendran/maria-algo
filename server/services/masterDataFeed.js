@@ -7,7 +7,9 @@ import { scanForRoll } from "./rollService.js";
 import { executeMarketExit } from "./orderService.js";
 import { kiteToFyersSymbol, getFyersIndexSymbol } from "./symbolMapper.js";
 
+// --- BASE SYMBOLS ---
 const NIFTY_SPOT = "NSE:NIFTY50-INDEX";
+const SENSEX_SPOT = "BSE:SENSEX-INDEX"; 
 const niftyCandleBuilder = new CandleBuilder(3);
 
 // Shared cache for Iron Condor
@@ -23,24 +25,31 @@ export const initMasterDataFeed = async (io) => {
     return;
   }
 
-  const formattedToken = accessToken.includes(":")
+  // --- 🛠️ V3 WEBSOCKET FIX ---
+  // 1. Ensure App ID has the '-100' suffix required for WebSockets
+  const wsAppId = appId.includes("-") ? appId : `${appId}-100`;
+
+  // 2. Combine into the strict AppID:Token string format
+  const wsToken = accessToken.includes(":")
     ? accessToken
-    : `${appId}:${accessToken}`;
+    : `${wsAppId}:${accessToken}`;
 
   console.log("🔌 Connecting to Unified Fyers V3 Master Socket...");
 
-  const fyersData = new fyersDataSocket({
-    access_token: formattedToken,
-    log_path: "./logs",
-  });
+  // 3. Initialize using getInstance to obey the Singleton rule
+  const fyersData = fyersDataSocket.getInstance(wsToken, "./logs");
+  
+  // 4. Enable Fyers native auto-reconnect
+  fyersData.autoreconnect();
+  // -----------------------------
 
   fyersData.on("connect", async () => {
     console.log(
       "✅ Master Feed Connected! Building unified subscription list...",
     );
 
-    // 1. Always subscribe to NIFTY SPOT for Traffic Light
-    let symbolsToSubscribe = [NIFTY_SPOT];
+    // 1. Base Subscriptions: NIFTY SPOT (Traffic Light) & SENSEX SPOT (Iron Condor)
+    let symbolsToSubscribe = [NIFTY_SPOT, SENSEX_SPOT];
 
     // 2. Add Iron Condor Legs if a trade is active
     const activeTrade = await ActiveTrade.findOne({ status: "ACTIVE" });
@@ -64,8 +73,8 @@ export const initMasterDataFeed = async (io) => {
       symbolsToSubscribe = [...new Set([...symbolsToSubscribe, ...icSymbols])];
     }
 
-    fyersData.subscribe(symbolsToSubscribe);
-    fyersData.mode(fyersData.type.LTP, symbolsToSubscribe);
+    // 3. Subscribe in Full Mode (passing 'false' as the second argument)
+    fyersData.subscribe(symbolsToSubscribe, false);
     console.log(
       `📡 Subscribed to ${symbolsToSubscribe.length} total symbols for both strategies.`,
     );
@@ -77,7 +86,7 @@ export const initMasterDataFeed = async (io) => {
 
     if (!symbol || !price) return;
 
-    // --- 🚦 TRAFFIC LIGHT LOGIC ---
+    // --- 🚦 TRAFFIC LIGHT LOGIC (Only catches Nifty) ---
     if (symbol === NIFTY_SPOT) {
       // 1. Tick logic & Dashboard emission
       await handleTick(price);
@@ -93,7 +102,7 @@ export const initMasterDataFeed = async (io) => {
       }
     }
 
-    // --- 🛡️ IRON CONDOR LOGIC ---
+    // --- 🛡️ IRON CONDOR LOGIC (Catches everything) ---
     // Update the cache for ALL incoming symbols (Spot + Options)
     lastPrices[symbol] = price;
 
@@ -104,8 +113,8 @@ export const initMasterDataFeed = async (io) => {
   fyersData.on("error", (err) => console.error("❌ Master Socket Error:", err));
 
   fyersData.on("close", () => {
-    console.log("❌ Master Socket Closed. Reconnecting in 5s...");
-    setTimeout(() => initMasterDataFeed(io), 5000);
+    console.log("❌ Master Socket Closed. Native auto-reconnect will handle it...");
+    // We rely on fyersData.autoreconnect() instead of a custom timeout now
   });
 
   fyersData.connect();

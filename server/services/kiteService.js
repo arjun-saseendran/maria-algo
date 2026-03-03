@@ -5,58 +5,61 @@ import path from 'path';
 
 dotenv.config();
 
-// Initialize the Kite Connect instance
 const kc = new KiteConnect({
   api_key: process.env.KITE_API_KEY,
   redirect_uri: process.env.KITE_REDIRECT_URL
 });
 
-// We will save the token to a file named 'kite_token.txt' in your root folder
 const TOKEN_FILE_PATH = path.join(process.cwd(), 'kite_token.txt');
-
 let dailyAccessToken = null;
 
-// ==========================================
-// LOAD TOKEN FROM DISK (ON SERVER START)
-// ==========================================
-export const loadTokenFromDisk = () => {
+export const loadTokenFromDisk = async () => {
   try {
     if (fs.existsSync(TOKEN_FILE_PATH)) {
       const savedToken = fs.readFileSync(TOKEN_FILE_PATH, 'utf8').trim();
       if (savedToken) {
         dailyAccessToken = savedToken;
         kc.setAccessToken(savedToken);
-        console.log(`✅ Loaded saved Kite Access Token from disk.`);
+        console.log(`✅ Loaded Kite Access Token from disk.`);
+        
+        // --- ADDED: Actual connection validation ---
+        await validateKiteSession(); 
+        
         return savedToken;
       }
     }
   } catch (err) {
-    console.error('❌ Error reading token from disk:', err.message);
+    console.error('❌ Kite Session Invalid:', err.message);
   }
   return null;
 };
 
-// ==========================================
-// SET AND SAVE NEW TOKEN (ON LOGIN)
-// ==========================================
-export const setAccessToken = (token) => {
+// NEW: Helper to verify the API is actually "connected"
+export const validateKiteSession = async () => {
+  try {
+    const profile = await kc.getProfile();
+    console.log(`📡 Kite API Connected: Welcome, ${profile.user_name} (${profile.user_id})`);
+    return true;
+  } catch (err) {
+    console.error('❌ Kite API Connection Failed:', err.message);
+    return false;
+  }
+};
+
+export const setAccessToken = async (token) => {
   dailyAccessToken = token;
   kc.setAccessToken(token);
-  
-  // Save to physical file so it survives server restarts
   fs.writeFileSync(TOKEN_FILE_PATH, token, 'utf8');
   console.log('✅ New Kite Access Token saved securely to disk.');
+  await validateKiteSession();
 };
 
 export const getAccessToken = () => {
-  if (!dailyAccessToken) {
-    return loadTokenFromDisk();
-  }
+  if (!dailyAccessToken) return loadTokenFromDisk();
   return dailyAccessToken;
 };
 
 export const getKiteInstance = () => {
-  // Ensure we have loaded the token into the instance if it exists
   if (!dailyAccessToken) loadTokenFromDisk();
   return kc;
 };
