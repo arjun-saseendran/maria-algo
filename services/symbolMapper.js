@@ -49,6 +49,13 @@ export const buildFyersOptionSymbol = (index, strike, type) => {
   return `${prefix}:${index}${yy}${m}${dd}${strike}${type}`;
 };
 
+// ✅ KEPT FOR BACKWARD COMPATIBILITY — used by ironCondorEngine and other services
+export const kiteToFyersSymbol = (kiteSymbol, index = 'NIFTY') => {
+  if (!kiteSymbol) return null;
+  const prefix = (index === 'SENSEX' || index === 'BANKEX') ? 'BSE' : 'NSE';
+  return `${prefix}:${kiteSymbol}`;
+};
+
 // Converts Fyers symbol back to Kite (strips the exchange prefix)
 export const fyersToKiteSymbol = (fyersSymbol) => {
   if (!fyersSymbol) return null;
