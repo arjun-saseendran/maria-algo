@@ -130,33 +130,8 @@ export const performUpstoxAutoLogin = async () => {
         // Wait longer for JS-rendered page
         await sleep(5000);
 
-        // Dump full HTML for debugging
-        const fullHtml = await page.evaluate(() => document.body.innerHTML.slice(0, 3000));
-        console.log("📄 Page HTML (first 3000 chars):\n", fullHtml);
-
-        const pageInputs = await page.evaluate(() => {
-            return Array.from(document.querySelectorAll("input")).map(el => ({
-                id: el.id, name: el.name, type: el.type,
-                placeholder: el.placeholder, className: el.className.slice(0,50)
-            }));
-        });
-        console.log("📋 Inputs found on page:", JSON.stringify(pageInputs, null, 2));
-
-        const mobileSelector = await page.evaluate(() => {
-            for (const sel of [
-                "input#mobileNum", "input#mobile", "input[name='mobile']",
-                "input[type='tel']", "input[placeholder*='mobile' i]",
-                "input[placeholder*='phone' i]", "input[placeholder*='number' i]",
-                "input[type='number']", "input[type='text']"
-            ]) {
-                if (document.querySelector(sel)) return sel;
-            }
-            return null;
-        });
-        if (!mobileSelector) throw new Error("Mobile input not found. Check page HTML above.");
-        console.log(`📱 Using mobile selector: ${mobileSelector}`);
-
-        await typeIntoInput(page, mobileSelector, UPSTOX_MOBILE);
+        // Confirmed selector: input#mobileNum
+        await typeIntoInput(page, "input#mobileNum", UPSTOX_MOBILE);
 
         // Find and click the OTP/continue button
         await page.evaluate(() => {
@@ -249,36 +224,42 @@ export const performUpstoxAutoLogin = async () => {
         console.log("🔐 PIN submitted.");
         await sleep(2000);
 
-        // ── Step 5: Intercept auth_code from redirect ─────────────────────────
+        // ── Step 5: Catch auth_code from navigation URL ──────────────────────
+        // Use 'response' event instead of aborting requests — auth code is
+        // single-use and aborting the redirect can cause race conditions with
+        // the live server also trying to consume it.
         console.log("🔍 Waiting for auth_code redirect...");
         let authCode = null;
 
-        await page.setRequestInterception(true);
         const codePromise = new Promise((resolve) => {
-            page.on("request", (req) => {
-                const url = req.url();
-                if (url.includes("code=")) {
-                    try {
-                        authCode = new URL(url).searchParams.get("code");
-                    } catch {}
-                    console.log("🎯 Auth code intercepted!");
-                    req.abort();
-                    resolve(authCode);
-                    return;
+            // Watch all navigations/responses for the redirect_uri with code=
+            page.on("response", (response) => {
+                const url = response.url();
+                if (url.includes(UPSTOX_REDIRECT_URI) && url.includes("code=")) {
+                    try { authCode = new URL(url).searchParams.get("code"); } catch {}
+                    if (authCode) { console.log("🎯 Auth code from response URL!"); resolve(authCode); }
                 }
-                req.continue().catch(() => {});
+            });
+            // Also watch for navigation events
+            page.on("framenavigated", (frame) => {
+                if (frame !== page.mainFrame()) return;
+                const url = frame.url();
+                if (url.includes("code=")) {
+                    try { authCode = new URL(url).searchParams.get("code"); } catch {}
+                    if (authCode) { console.log("🎯 Auth code from navigation!"); resolve(authCode); }
+                }
             });
         });
 
-        await Promise.race([codePromise, sleep(10000)]);
+        await Promise.race([codePromise, sleep(15000)]);
 
-        // Fallback: check current URL
+        // Final fallback: check current page URL
         if (!authCode) {
-            try {
-                authCode = new URL(page.url()).searchParams.get("code");
-            } catch {}
+            try { authCode = new URL(page.url()).searchParams.get("code"); } catch {}
         }
-        if (!authCode) throw new Error("auth_code not found in redirect. Check UPSTOX_REDIRECT_URI in Upstox Developer Console.");
+        if (!authCode) throw new Error("auth_code not found. Check UPSTOX_REDIRECT_URI matches Developer Console exactly.");
+
+        console.log("✅ Auth code received.");
 
         console.log("✅ Auth code received.");
 
@@ -293,7 +274,13 @@ export const performUpstoxAutoLogin = async () => {
                 redirect_uri:  UPSTOX_REDIRECT_URI,
                 grant_type:    "authorization_code",
             }),
-            { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+            {
+                headers: {
+                    "Content-Type":  "application/x-www-form-urlencoded",
+                    "Accept":        "application/json",
+                    "Api-Version":   "2.0",
+                }
+            }
         );
 
         if (!tokenRes.data?.access_token) {
@@ -303,11 +290,11 @@ export const performUpstoxAutoLogin = async () => {
         const accessToken = tokenRes.data.access_token;
         console.log("✅ Access token retrieved successfully!");
 
-        // ── Step 7: Save token ────────────────────────────────────────────────
+        // Save token directly to .env — no redirect needed
         updateEnvFile("UPSTOX_ACCESS_TOKEN", accessToken);
         setUpstoxAccessToken(accessToken);
 
-        console.log("🎉 Done! Upstox access token saved. Ready for orders.");
+        console.log("🎉 Done! Upstox access token saved to .env. Ready for orders.");
         return accessToken;
 
     } catch (error) {
