@@ -1,12 +1,12 @@
 import { fyersDataSocket } from "fyers-api-v3";
-import { getIO } from "../socket.js";
-import { CandleBuilder } from "../services/candleBuilder.js";
+import { getIO } from "../config/socket.js";
+import { CandleBuilder } from "../services/candleBuilderTraficLight.js";
 
 // 🧠 Import the Brains (Your Strategy Modules)
-import { handleNewCandle, handleTick } from "../strategies/strategyEngine.js"; // Traffic Light
-import { updateCondorPrice, monitorCondorLevels } from "../strategies/ironCondor.js"; // Iron Condor
+import { handleNewCandle, handleTick } from "../Engines/traficLightEngine.js"; // Traffic Light
+import { updateCondorPrice, monitorCondorLevels } from "../Engines/ironCondorEngine.js"; // Iron Condor
 
-import ActiveTrade from "../models/activeTradeModel.js";
+import ActiveTrade from "../models/ironCondorActiveTradeModel.js";
 import { kiteToFyersSymbol, getFyersIndexSymbol } from "../services/symbolMapper.js";
 
 // --- BASE SYMBOLS ---

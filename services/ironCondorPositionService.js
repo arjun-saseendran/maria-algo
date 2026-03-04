@@ -1,4 +1,4 @@
-import { getKiteInstance } from './kiteService.js';
+import { getKiteInstance } from '../config/kiteConfig.js';
 
 export const fetchAndCategorizePositions = async () => {
   const kc = getKiteInstance();

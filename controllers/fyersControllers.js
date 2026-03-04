@@ -1,8 +1,8 @@
-import fyers, { setFyersAccessToken } from "../config/fyersConfig.js";
+import { fyers, setFyersAccessToken } from "../config/fyersConfig.js";
 import { User } from "../models/userModel.js";
 import { Token } from "../models/tokenModel.js";
 // 🚨 CHANGED: Import the new Master Data Feed instead of individual sockets
-import { initMasterDataFeed } from "../services/masterDataFeed.js"; 
+import { initFyersLiveData } from "../services/fyersLiveData.js";
 
 // ==========================================
 // LOGIN — redirects to Fyers OAuth page
@@ -41,7 +41,7 @@ export const fyersCallback = async (req, res) => {
 
     // 🚨 CHANGED: Start the unified Master Data Feed
     const io = req.app.get("io");
-    await initMasterDataFeed(io);
+    await initFyersLiveData(io);
 
     // Save user + token to Traffic Light DB
     const profile = await fyers.get_profile();
@@ -60,11 +60,11 @@ export const fyersCallback = async (req, res) => {
     await Token.findOneAndUpdate(
       { user: user._id },
       { accessToken },
-      { upsert: true, returnDocument: "after" }
+      { upsert: true, returnDocument: "after" },
     );
 
     res.send(
-      "<h1>✅ Fyers Connected!</h1><p>The Master Strategy feed is now live. You can close this tab.</p>"
+      "<h1>✅ Fyers Connected!</h1><p>The Master Strategy feed is now live. You can close this tab.</p>",
     );
   } catch (error) {
     console.error("❌ Fyers Auth Error:", error);

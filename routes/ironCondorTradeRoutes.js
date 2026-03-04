@@ -1,11 +1,9 @@
 import express from 'express';
-import { scanAndSyncOrders } from '../services/orderMonitorService.js';
-import ActiveTrade from '../models/activeTradeModel.js';
-// 🚨 FIXED: Now imports from the Fyers Ticker
-import { lastPrices } from '../services/masterDataFeed.js'; 
-import { getKiteInstance } from '../services/kiteService.js'; 
+// 🚨 FIXED: Import both the sync function and the price cache from the Engine
+import { scanAndSyncOrders, condorPrices } from '../Engines/ironCondorEngine.js';
+import ActiveTrade from '../models/ironCondorActiveTradeModel.js';
+import { getKiteInstance } from '../config/kiteConfig.js'; 
 import { sendTelegramAlert } from '../services/telegramService.js';
-// 🚨 NEW: Import mapper for price lookups
 import { kiteToFyersSymbol } from '../services/symbolMapper.js'; 
 
 const router = express.Router();
@@ -29,8 +27,8 @@ router.get('/active', async (req, res) => {
     const liveStats = trades.map(trade => {
       const { symbols, callSpreadEntryPremium, putSpreadEntryPremium, bufferPremium, tradeType, index } = trade;
 
-      // 🚨 FIXED: Lookup prices using Fyers symbols via the mapper
-      const getLtp = (sym) => lastPrices[kiteToFyersSymbol(sym, index)] || 0;
+      // 🚨 FIXED: Now looks up prices using the 'condorPrices' cache imported from the Engine
+      const getLtp = (sym) => condorPrices[kiteToFyersSymbol(sym, index)] || 0;
 
       const currentCallNet = tradeType !== 'PUT_SPREAD' && symbols.callSell ? Math.abs(getLtp(symbols.callSell) - getLtp(symbols.callBuy)) : 0;
       const currentPutNet = tradeType !== 'CALL_SPREAD' && symbols.putSell ? Math.abs(getLtp(symbols.putSell) - getLtp(symbols.putBuy)) : 0;
@@ -77,7 +75,7 @@ router.get('/active', async (req, res) => {
 // --- 2. MANUAL SYNC ---
 router.post('/sync', async (req, res) => {
   try {
-    await scanAndSyncOrders(); 
+    await scanAndSyncOrders();
     const activeTrade = await ActiveTrade.findOne({ status: 'ACTIVE' });
     res.status(200).json({ status: 'success', trade: activeTrade });
   } catch (error) {

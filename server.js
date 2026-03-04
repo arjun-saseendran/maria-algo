@@ -9,22 +9,23 @@ import mongoose from "mongoose";
 // ─── Config & Routes ──────────────────────────────────────────────────────────
 import { connectDatabases, getCondorDB } from "./config/db.js";
 import authRoutes     from "./routes/authRoutes.js";
-import tradeRoutes    from "./routes/tradeRoutes.js";
-import optionsRoutes  from "./routes/optionsRoutes.js";
-import positionRoutes from "./routes/positionRoutes.js";
+import tradeRoutes    from "./routes/ironCondorTradeRoutes.js";
+import optionsRoutes  from "./routes/optionChainRoutes.js";
+import positionRoutes from "./routes/ironCondorPositionRoutes.js";
 
 // ─── SAFE MODEL LOADING ───────────────────────────────────────────────────────
-// We import them, but we must ensure the files themselves use Singleton exports
-import ActiveTrade              from "./models/activeTradeModel.js";
+import ActiveTrade              from "./models/ironCondorActiveTradeModel.js";
 import TradePerformance         from "./models/trafficTradePerformanceModel.js";
-import { DailyStatus }          from "./models/dailyStatusModel.js";
+import { DailyStatus }          from "./models/traficLightDailyStatusModel.js";
 
 // ─── Services & Strategy ──────────────────────────────────────────────────────
-import { resetDailyState, tradeState } from "./state/tradeState.js";
-import { scanAndSyncOrders } from "./services/orderMonitorService.js";
-import { loadTokenFromDisk, getKiteInstance } from "./services/kiteService.js";
+import { resetDailyState, tradeState } from "./state/traficLightTradeState.js";
+// 🚨 FIXED: Import condorPrices cache directly from the Engine
+import { scanAndSyncOrders, condorPrices } from "./Engines/ironCondorEngine.js";
+import { loadTokenFromDisk, getKiteInstance } from "./config/kiteConfig.js";
 import { sendTelegramAlert } from "./services/telegramService.js";
-import { initMasterDataFeed, lastPrices }  from "./services/masterDataFeed.js";
+// 🚨 FIXED: Use the correct named export 'initFyersLiveData'
+import { initFyersLiveData } from "./services/fyersLiveData.js";
 import { kiteToFyersSymbol } from "./services/symbolMapper.js";
 
 const app    = express();
@@ -60,7 +61,8 @@ app.get("/api/condor/positions", async (req, res) => {
     if (!activeTrade) return res.json([]);
     
     const idx = activeTrade.index;
-    const getLtp = (sym) => sym ? (lastPrices[kiteToFyersSymbol(sym, idx)] || 0) : 0;
+    // 🚨 FIXED: Reference 'condorPrices' cache for real-time spread valuation
+    const getLtp = (sym) => sym ? (condorPrices[kiteToFyersSymbol(sym, idx)] || 0) : 0;
 
     const currentCallNet = activeTrade.symbols.callSell 
         ? Math.abs(getLtp(activeTrade.symbols.callSell) - getLtp(activeTrade.symbols.callBuy)) : 0;
@@ -135,7 +137,8 @@ const start = async () => {
     server.listen(PORT, async () => {
       console.log(`🚀 Maria Algo Server Online · port ${PORT}`);
       await sendTelegramAlert("🤖 <b>Maria Algo Online</b>");
-      if (process.env.FYERS_ACCESS_TOKEN) await initMasterDataFeed(io);
+      // 🚨 FIXED: Call the correct named function for Fyers Live Data
+      if (process.env.FYERS_ACCESS_TOKEN) await initFyersLiveData(io);
       setInterval(async () => { try { await scanAndSyncOrders(); } catch (err) {} }, 60000);
     });
   } catch (err) { console.error("Fatal:", err); process.exit(1); }

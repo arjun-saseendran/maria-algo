@@ -1,10 +1,10 @@
 import { getKiteInstance } from '../config/kiteConfig.js';
 import { getQuotes } from '../config/fyersConfig.js';
-import { getIO } from '../socket.js'; 
+import { getIO } from '../config/socket.js'; 
 import { sendTelegramAlert } from '../services/telegramService.js';
-import { executeMarketExit } from '../services/orderService.js';
+import { executeMarketExit } from '../services/IronCodorOrderService.js';
 import { kiteToFyersSymbol, getFyersIndexSymbol } from '../services/symbolMapper.js';
-import ActiveTrade from '../models/activeTradeModel.js';
+import ActiveTrade from '../models/ironCondorActiveTradeModel.js';
 import TradePerformance from '../models/condorTradePerformanceModel.js';
 import dotenv from 'dotenv';
 
@@ -13,7 +13,7 @@ dotenv.config();
 // ==========================================
 // 🧠 1. STATE & CACHE MANAGER
 // ==========================================
-const condorPrices = {};
+export const condorPrices = {};
 let lastScanTime = 0;
 
 export const updateCondorPrice = (symbol, price) => {

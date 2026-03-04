@@ -1,4 +1,4 @@
-import fyers from "../config/fyersConfig.js";
+import {fyers} from "../config/fyersConfig.js";
 
 export const placeOrder = async ({ symbol, qty, side }) => {
   const sideLabel = side === 1 ? 'BUY' : 'SELL';
