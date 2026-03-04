@@ -1,8 +1,10 @@
 import puppeteer from 'puppeteer';
-import { getKiteInstance, setAccessToken } from './services/kiteService.js';
+import { getKiteInstance, setAccessToken } from './config/kiteConfig.js';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { createHmac } from 'crypto';
+import fs from 'fs';
+import path from 'path';
 
 dotenv.config();
 
@@ -41,6 +43,38 @@ const typeIntoReactInput = async (page, selector, value) => {
         el.dispatchEvent(new Event('change', { bubbles: true }));
     }, selector, value);
     await sleep(200);
+};
+
+/**
+ * Writes or updates a key=value pair in the .env file.
+ * If the key already exists, it replaces the line. Otherwise, it appends it.
+ */
+const saveTokenToEnv = (key, value) => {
+    const envPath = path.resolve(process.cwd(), '.env');
+    let content = '';
+
+    if (fs.existsSync(envPath)) {
+        content = fs.readFileSync(envPath, 'utf8');
+    }
+
+    const lines = content.split('\n');
+    const keyPattern = new RegExp(`^${key}=.*$`);
+    const exists = lines.some(line => keyPattern.test(line));
+
+    let updatedContent;
+    if (exists) {
+        // Replace the existing line
+        updatedContent = lines.map(line => keyPattern.test(line) ? `${key}=${value}` : line).join('\n');
+    } else {
+        // Append new key at the end (ensure no double blank lines)
+        updatedContent = content.trimEnd() + `\n${key}=${value}\n`;
+    }
+
+    fs.writeFileSync(envPath, updatedContent, 'utf8');
+    console.log(`✅ ${key} saved to .env`);
+
+    // Also update the live process.env so the current process can use it immediately
+    process.env[key] = value;
 };
 
 export const performZerodhaAutoLogin = async () => {
@@ -151,11 +185,17 @@ export const performZerodhaAutoLogin = async () => {
         }
         if (!requestToken) throw new Error("request_token not found. Verify KITE_REDIRECT_URL in Kite Developer Console.");
 
-        console.log("\u2699\ufe0f  Generating access token...");
+        console.log("⚙️  Generating access token...");
         const kc = getKiteInstance();
         const session = await kc.generateSession(requestToken, apiSecret);
+
+        // Save access token to .env file (and update process.env live)
+        saveTokenToEnv('KITE_ACCESS_TOKEN', session.access_token);
+
+        // Also pass it to the kite service
         setAccessToken(session.access_token);
-        console.log("🎉 Done! Kite access token saved. Iron Condor orders ready.");
+
+        console.log("🎉 Done! Kite access token saved to .env. Iron Condor orders ready.");
 
     } catch (error) {
         console.error("\n❌ Auto-Login Failed:", error.message);
