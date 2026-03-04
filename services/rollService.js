@@ -1,4 +1,5 @@
-import fyers from "../config/fyersConfig.js"; 
+// ✅ IMPORT THE NEW V3 HELPER
+import { getQuotes } from "../config/fyersConfig.js"; 
 import { kiteToFyersSymbol } from './symbolMapper.js';
 import dotenv from 'dotenv';
 
@@ -51,10 +52,11 @@ export const scanForRoll = async (trade, liveSpotPrice, io) => {
         }
 
         const symbolsString = strikesToScan.flatMap(s => [s.sellFyers, s.buyFyers]).join(',');
-        const response = await fyers.get_quotes(symbolsString);
         
-        if (response.s !== "ok") return;
-        const quotes = response.d;
+        // 1️⃣ Fetch Quotes from Fyers (Using new V3 Helper)
+        const quotes = await getQuotes(symbolsString);
+        
+        if (!quotes) return;
 
         let suggestedRoll = null;
         for (const pair of strikesToScan) {

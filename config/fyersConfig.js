@@ -1,68 +1,90 @@
 import { fyersModel } from "fyers-api-v3";
-import fs from "fs";
-import path from "path";
-import "dotenv/config";
+import "dotenv/config"; // Cleaner way to load .env
 
-// 🛡️ Safety check for Environment Variables
-if (!process.env.FYERS_APP_ID || !process.env.FYERS_REDIRECT_URI) {
-  console.error("❌ FYERS Config Error: Missing FYERS_APP_ID or FYERS_REDIRECT_URI in .env");
-  process.exit(1);
-}
-
-// Ensure logs directory exists for the SDK
-const logDir = path.resolve("./logs");
-if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
-
-/**
- * ✅ FYERS V3 INITIALIZATION
- * The new SDK does not require the log path in the constructor like V2 did.
- * We create a single shared instance for the entire application.
- */
+// =============================
+// 🔐 INIT FYERS
+// =============================
 const fyers = new fyersModel();
 
 fyers.setAppId(process.env.FYERS_APP_ID);
-fyers.setRedirectUrl(process.env.FYERS_REDIRECT_URI);
+// Using FYERS_REDIRECT_URI based on your previous logs
+fyers.setRedirectUrl(process.env.FYERS_REDIRECT_URI || process.env.FYERS_REDIRECT_URL);
 
-// Load the existing Access Token if available
+// Load on startup if available, but don't crash if it's waiting for auto-login
 if (process.env.FYERS_ACCESS_TOKEN) {
   fyers.setAccessToken(process.env.FYERS_ACCESS_TOKEN);
-  console.log("✅ Fyers Access Token loaded from .env");
+  console.log("✅ Fyers Access Token Loaded");
+} else {
+  console.warn("⚠️ FYERS_ACCESS_TOKEN missing in .env. Waiting for manual/auto login.");
 }
 
-/**
- * 📡 GLOBAL HELPER: Fetch Quotes (V3 Compliant)
- * This replaces the broken 'get_quotes' calls.
- * @param {Array} symbolsArray - e.g. ["NSE:NIFTY50-INDEX", "NSE:SBIN-EQ"]
- */
-export const getQuotes = async (symbolsArray) => {
-  try {
-    if (!symbolsArray || symbolsArray.length === 0) return null;
+// Global setter used by your auto-login script
+export const setFyersAccessToken = (token) => {
+  fyers.setAccessToken(token);
+  process.env.FYERS_ACCESS_TOKEN = token;
+  console.log("✅ Fyers Access Token dynamically updated.");
+};
 
-    // ✅ FIXED: V3 expects { symbols: "SYM1,SYM2" }
+// =============================
+// 📈 GET QUOTES (Fixed for Arrays)
+// =============================
+export const getQuotes = async (symbols) => {
+  try {
+    // 🔥 FIX: Handles both ["NSE:A", "NSE:B"] arrays AND "NSE:A,NSE:B" strings
+    const formattedSymbols = Array.isArray(symbols) ? symbols.join(',') : symbols;
+    
     const response = await fyers.quotes({
-      symbols: symbolsArray.join(',')
+      symbols: formattedSymbols 
     });
 
-    if (response && response.s === "ok") {
-      return response.d; // 'd' contains the array of quote objects
-    } else {
-      console.warn("⚠️ Fyers Quote Warning:", response.errmsg || "Unknown Error");
-      return null;
-    }
-  } catch (err) {
-    console.error("❌ Fyers V3 Quote Error:", err.message);
+    // Return just the data array so your strategy code doesn't have to parse it
+    return (response && response.s === "ok") ? response.d : null;
+  } catch (error) {
+    console.error("❌ Fyers Quotes Error:", error.message);
     return null;
   }
 };
 
-/**
- * 🔑 TOKEN HANDLER
- * Updates the instance and the environment variable for both strategies.
- */
-export const setFyersAccessToken = (token) => {
-  fyers.setAccessToken(token);
-  process.env.FYERS_ACCESS_TOKEN = token;
-  console.log("✅ Fyers Access Token set — both strategies ready.");
+// =============================
+// 📊 GET OPTION CHAIN
+// =============================
+export const getOptionChain = async (symbol) => {
+  try {
+    const response = await fyers.optionchain({
+      symbol: symbol,
+      strikecount: 10 // V3 usually requires strike count
+    });
+    return response;
+  } catch (error) {
+    console.error("❌ Fyers Option Chain Error:", error.message);
+    return null;
+  }
 };
 
-export default fyers;
+// =============================
+// 🛒 PLACE ORDER
+// =============================
+export const placeOrder = async (orderData) => {
+  try {
+    const response = await fyers.place_order(orderData);
+    return response;
+  } catch (error) {
+    console.error("❌ Fyers Order Error:", error.message);
+    throw error;
+  }
+};
+
+// =============================
+// ❌ EXIT POSITION
+// =============================
+export const exitPosition = async (exitData) => {
+  try {
+    const response = await fyers.exit_positions(exitData);
+    return response;
+  } catch (error) {
+    console.error("❌ Fyers Exit Error:", error.message);
+    throw error;
+  }
+};
+
+export { fyers };

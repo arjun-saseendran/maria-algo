@@ -1,5 +1,6 @@
 import express from 'express';
-import fyers from '../config/fyersConfig.js'; // 🚨 NEW: Fetching data from Fyers
+// ✅ IMPORT THE NEW V3 HELPER
+import { getQuotes } from '../config/fyersConfig.js'; 
 import { getFyersIndexSymbol, kiteToFyersSymbol } from '../services/symbolMapper.js';
 
 const router = express.Router();
@@ -11,9 +12,16 @@ router.get('/chain', async (req, res) => {
   try {
     const indexSymbol = getFyersIndexSymbol(symbol);
     
-    // 1️⃣ Fetch Spot Price from Fyers
-    const spotRes = await fyers.get_quotes(indexSymbol);
-    const spotPrice = spotRes.d[0].v.lp;
+    // 1️⃣ Fetch Spot Price from Fyers (Using new V3 Helper)
+    const spotData = await getQuotes(indexSymbol);
+    
+    // Safety check in case the API returns null
+    if (!spotData || spotData.length === 0) {
+        return res.status(500).json({ error: "Failed to fetch Spot Price" });
+    }
+    
+    // Extract the Last Traded Price (lp)
+    const spotPrice = spotData[0].v.lp;
 
     // 2️⃣ Calculate ATM Strike
     const step = symbol === 'NIFTY' ? 50 : 100;
@@ -32,9 +40,12 @@ router.get('/chain', async (req, res) => {
       instruments.push(kiteToFyersSymbol(`${symbol}${expiry}${strike}PE`, symbol));
     });
 
-    // 5️⃣ Fetch Quotes from Fyers (Free)
-    const quotesRes = await fyers.get_quotes(instruments.join(','));
-    const quotes = quotesRes.d;
+    // 5️⃣ Fetch Quotes from Fyers (Using new V3 Helper)
+    const quotes = await getQuotes(instruments.join(','));
+    
+    if (!quotes) {
+         return res.status(500).json({ error: "Failed to fetch Options Quotes" });
+    }
 
     // 6️⃣ Format for React UI
     const formattedChain = strikes.map(strike => {
