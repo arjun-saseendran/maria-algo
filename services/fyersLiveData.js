@@ -4,15 +4,22 @@ import { CandleBuilder } from "../services/candleBuilderTraficLight.js";
 
 // 🧠 Import the Brains (Your Strategy Modules)
 import { handleNewCandle, handleTick } from "../Engines/traficLightEngine.js"; // Traffic Light
-import { updateCondorPrice, monitorCondorLevels } from "../Engines/ironCondorEngine.js"; // Iron Condor
+import {
+  updateCondorPrice,
+  monitorCondorLevels,
+} from "../Engines/ironCondorEngine.js"; // Iron Condor
 
-import ActiveTrade from "../models/ironCondorActiveTradeModel.js";
-import { kiteToFyersSymbol, getFyersIndexSymbol } from "../services/fyersSymbolMapper.js";
+import getActiveTradeModel from "../models/ironCondorActiveTradeModel.js";
+import {
+  kiteToFyersSymbol,
+  getFyersIndexSymbol,
+} from "../services/fyersSymbolMapper.js";
 
 // --- BASE SYMBOLS ---
 const NIFTY_SPOT = "NSE:NIFTY50-INDEX";
-const SENSEX_SPOT = "BSE:SENSEX-INDEX"; 
+const SENSEX_SPOT = "BSE:SENSEX-INDEX";
 const niftyCandleBuilder = new CandleBuilder(3);
+
 
 export const initFyersLiveData = async () => {
   const io = getIO();
@@ -26,13 +33,16 @@ export const initFyersLiveData = async () => {
 
   // --- 🛠️ V3 WEBSOCKET SETUP ---
   const wsAppId = appId.includes("-") ? appId : `${appId}-100`;
-  const wsToken = accessToken.includes(":") ? accessToken : `${wsAppId}:${accessToken}`;
+  const wsToken = accessToken.includes(":")
+    ? accessToken
+    : `${wsAppId}:${accessToken}`;
 
   console.log("🔌 Connecting to Fyers Live Data Socket...");
   const fyersData = fyersDataSocket.getInstance(wsToken, "./logs");
   fyersData.autoreconnect();
 
   fyersData.on("connect", async () => {
+    const ActiveTrade = getActiveTradeModel();
     console.log("✅ Fyers Live Data Connected! Building subscription list...");
 
     let symbolsToSubscribe = [NIFTY_SPOT, SENSEX_SPOT];
@@ -42,10 +52,18 @@ export const initFyersLiveData = async () => {
     if (activeTrade) {
       const icSymbols = [
         getFyersIndexSymbol(activeTrade.index),
-        activeTrade.symbols.callSell ? kiteToFyersSymbol(activeTrade.symbols.callSell, activeTrade.index) : null,
-        activeTrade.symbols.callBuy ? kiteToFyersSymbol(activeTrade.symbols.callBuy, activeTrade.index) : null,
-        activeTrade.symbols.putSell ? kiteToFyersSymbol(activeTrade.symbols.putSell, activeTrade.index) : null,
-        activeTrade.symbols.putBuy ? kiteToFyersSymbol(activeTrade.symbols.putBuy, activeTrade.index) : null,
+        activeTrade.symbols.callSell
+          ? kiteToFyersSymbol(activeTrade.symbols.callSell, activeTrade.index)
+          : null,
+        activeTrade.symbols.callBuy
+          ? kiteToFyersSymbol(activeTrade.symbols.callBuy, activeTrade.index)
+          : null,
+        activeTrade.symbols.putSell
+          ? kiteToFyersSymbol(activeTrade.symbols.putSell, activeTrade.index)
+          : null,
+        activeTrade.symbols.putBuy
+          ? kiteToFyersSymbol(activeTrade.symbols.putBuy, activeTrade.index)
+          : null,
       ].filter(Boolean);
 
       symbolsToSubscribe = [...new Set([...symbolsToSubscribe, ...icSymbols])];
@@ -69,18 +87,24 @@ export const initFyersLiveData = async () => {
 
       const finishedCandle = niftyCandleBuilder.build(price, Date.now());
       if (finishedCandle) {
-        console.log(`\n📦 New 3-Min Candle: ${finishedCandle.color.toUpperCase()} | Range: ${finishedCandle.range.toFixed(2)}`);
+        console.log(
+          `\n📦 New 3-Min Candle: ${finishedCandle.color.toUpperCase()} | Range: ${finishedCandle.range.toFixed(2)}`,
+        );
         handleNewCandle(finishedCandle);
       }
     }
 
     // 🛡️ 2. Feed the Iron Condor Strategy (All Symbols)
     updateCondorPrice(symbol, price); // Update the cache in the brain
-    await monitorCondorLevels();      // Tell the brain to check SL/Decay
+    await monitorCondorLevels(); // Tell the brain to check SL/Decay
   });
 
-  fyersData.on("error", (err) => console.error("❌ Fyers Live Data Error:", err));
-  fyersData.on("close", () => console.log("❌ Fyers Live Data Closed. Auto-reconnecting..."));
+  fyersData.on("error", (err) =>
+    console.error("❌ Fyers Live Data Error:", err),
+  );
+  fyersData.on("close", () =>
+    console.log("❌ Fyers Live Data Closed. Auto-reconnecting..."),
+  );
 
   fyersData.connect();
 };
