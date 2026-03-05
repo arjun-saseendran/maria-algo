@@ -1,8 +1,16 @@
 import { tradeState, pruneCandles } from "../state/traficLightTradeState.js";
 import { placeOrder } from "../services/trafficLightOrderService.js";
 import { DailyStatus } from "../models/traficLightDailyStatusModel.js"; 
-import TrafficTradePerformance from "../models/trafficTradePerformanceModel.js"; // 🚨 ADDED: For History Archival
-import { sendTelegramAlert } from "../services/telegramService.js";
+import TrafficTradePerformance from "../models/trafficTradePerformanceModel.js";
+import { sendTrafficAlert } from "../services/telegramService.js";
+
+let _io = null;
+export const setIO = (io) => { _io = io; };
+
+const emitLog = (msg, level = "info") => {
+  console.log(msg);
+  if (_io) _io.emit("trade_log", { msg, level, strategy: "TRAFFIC", time: new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" }) });
+};
 
 const RANGE_LIMIT = 30; // Max points allowed for the 2-candle setup
 const LOT_SIZE = 65; // Updated SEBI Lot Size
@@ -22,7 +30,7 @@ export const handleNewCandle = (candle) => {
   
   // RULE: Ignore the very first 3-minute candle of the day (9:15 - 9:18 AM)
   if (candleTime.getHours() === 9 && candleTime.getMinutes() < 18) {
-      console.log("⏳ Skipping first 3-min candle...");
+      emitLog("⏳ Skipping first 3-min candle...", "info");
       return; 
   }
 
@@ -52,18 +60,18 @@ export const handleNewCandle = (candle) => {
   const totalRange = high - low;
 
   if (totalRange >= RANGE_LIMIT) {
-      console.log(`ℹ️ Pattern found but range (${totalRange.toFixed(2)}) is > 30. Skipping.`);
+      emitLog(`ℹ️ Range ${totalRange.toFixed(2)} > 30. Skipping.`, "warn");
       return; 
   }
 
   // Lock the Range for Entry
   tradeState.breakoutHigh = high;
   tradeState.breakoutLow = low;
-  console.log(`🎯 TRAFFIC LIGHT RANGE LOCKED!`);
-  console.log(`📏 High: ${high} | Low: ${low} | Range: ${totalRange.toFixed(2)}`);
+  emitLog("🎯 TRAFFIC LIGHT RANGE LOCKED!", "success");
+  emitLog(`📏 High: ${high} | Low: ${low} | Range: ${totalRange.toFixed(2)}`, "info");
 
   // 🔔 TELEGRAM: Notify when range is locked
-  sendTelegramAlert(`🎯 <b>Range Locked</b>\nHigh: ${high}\nLow: ${low}\nRange: ${totalRange.toFixed(2)}`);
+  sendTrafficAlert(`🎯 <b>Range Locked</b>\nHigh: ${high}\nLow: ${low}\nRange: ${totalRange.toFixed(2)}`);
 
   DailyStatus.findOneAndUpdate(
     { date: getTodayString() }, { breakoutHigh: high, breakoutLow: low }, { upsert: true } 
@@ -77,7 +85,7 @@ export const handleTick = async (spotPrice) => {
   // RULE: Hard exit at 3:21 PM
   if (now.getHours() === 15 && now.getMinutes() >= 21) {
     if (tradeState.tradeActive) {
-      console.log("⏰ 3:21 PM Reached. Squaring off position...");
+      emitLog("⏰ 3:21 PM — Squaring off position", "warn");
       await exitTrade(spotPrice, "3:21 PM Time Exit");
     }
     return;
@@ -111,7 +119,7 @@ async function manageTrade(spotPrice) {
       const sl = (direction === "CE") ? breakoutLow : breakoutHigh; 
       
       if ((direction === "CE" && spotPrice <= sl) || (direction === "PE" && spotPrice >= sl)) {
-        console.log(`❌ Stoploss Hit at ${spotPrice}. Exiting.`);
+        emitLog(`❌ Stoploss Hit at ${spotPrice}`, "error");
         await exitTrade(spotPrice, "Stoploss Hit");
         return;
       }
@@ -122,13 +130,13 @@ async function manageTrade(spotPrice) {
         tradeState.trailSL = (direction === "CE") ? (entryPrice + targetPoints) : (entryPrice - targetPoints);
         
         // 🔔 TELEGRAM: Notify Profit Locked
-        sendTelegramAlert(`💰 <b>1:3 Profit Locked!</b>\nSide: ${direction}\nLocked Level: ${tradeState.trailSL.toFixed(2)}`);
-        console.log(`💰 1:3 Target Hit! Profit locked at ${tradeState.trailSL.toFixed(2)}.`);
+        sendTrafficAlert(`💰 <b>1:3 Profit Locked!</b>\nSide: ${direction}\nLocked Level: ${tradeState.trailSL.toFixed(2)}`);
+        emitLog(`💰 1:3 Target Hit! Locked at ${tradeState.trailSL.toFixed(2)}`, "success");
       }
     } else {
       // TRAILING: Only exit if price reverses to hit our locked 1:3 profit level
       if ((direction === "CE" && spotPrice <= tradeState.trailSL) || (direction === "PE" && spotPrice >= tradeState.trailSL)) {
-         console.log("📈 Profit Protection Hit. Closing trade.");
+         emitLog("📈 Profit Protection Hit. Closing trade.", "success");
          await exitTrade(spotPrice, "1:3 Profit Protection Secured");
       }
     }
@@ -137,7 +145,7 @@ async function manageTrade(spotPrice) {
 async function enterTrade(direction, spotPrice) {
   const symbol = getOptionSymbol(direction, spotPrice);
   try {
-    console.log(`🚀 Entering ${direction} Trade at ${spotPrice} (ATM Strike)`);
+    emitLog(`🚀 Entering ${direction} at ${spotPrice}`, "success");
     await DailyStatus.findOneAndUpdate({ date: getTodayString() }, { tradeTakenToday: true }, { upsert: true });
     
     tradeState.tradeTakenToday = true;
@@ -150,9 +158,9 @@ async function enterTrade(direction, spotPrice) {
     await placeOrder({ symbol, qty: LOT_SIZE, side: 1 });
 
     // 🔔 TELEGRAM: Notify Entry
-    sendTelegramAlert(`🚀 <b>Trade Entered</b>\nSide: ${direction}\nEntry Spot: ${spotPrice}\nStrike: ${symbol}`);
+    sendTrafficAlert(`🚀 <b>Trade Entered</b>\nSide: ${direction}\nEntry Spot: ${spotPrice}\nStrike: ${symbol}`);
 
-  } catch (err) { console.error("❌ Execution Error:", err.message); }
+  } catch (err) { emitLog(`❌ Execution Error: ${err.message}`, "error"); }
 }
 
 async function exitTrade(exitSpotPrice, reason = "Manual Exit") {
@@ -178,16 +186,16 @@ async function exitTrade(exitSpotPrice, reason = "Manual Exit") {
           realizedPnL: realizedPnL,
           notes: `Strategy: Traffic Light | Range: ${(tradeState.breakoutHigh - tradeState.breakoutLow).toFixed(2)} | Final PnL: ₹${realizedPnL.toFixed(2)}`
       });
-      console.log(`💾 Trade archived to History DB.`);
+      emitLog("💾 Trade archived to DB", "info");
   } catch (dbErr) {
-      console.error("❌ Failed to save history:", dbErr.message);
+      emitLog(`❌ DB Error: ${dbErr.message}`, "error");
   }
 
   // 🔔 TELEGRAM: Notify Exit
-  sendTelegramAlert(`🏁 <b>Trade Closed</b>\nReason: ${reason}\nExit Spot: ${exitSpotPrice}\nEstimated PnL: ₹${realizedPnL.toFixed(2)}`);
+  sendTrafficAlert(`🏁 <b>Trade Closed</b>\nReason: ${reason}\nExit Spot: ${exitSpotPrice}\nEstimated PnL: ₹${realizedPnL.toFixed(2)}`);
 
   tradeState.tradeActive = false;
-  console.log(`🏁 Trade Cycle Complete: ${reason}`);
+  emitLog(`🏁 Trade Complete: ${reason}`, "success");
 }
 
 function getOptionSymbol(direction, spotPrice) {
@@ -198,9 +206,11 @@ function getOptionSymbol(direction, spotPrice) {
   const daysToTuesday = (2 + 7 - d.getDay()) % 7; 
   d.setDate(d.getDate() + daysToTuesday);
   
-  const year = d.getFullYear().toString().slice(-2); 
-  let month = (d.getMonth() + 1).toString().padStart(2, "0");
+  const year = d.getFullYear().toString().slice(-2);
+  // Fyers weekly format uses single-digit month (1-9), then O=Oct, N=Nov, D=Dec
+  const monthNum = d.getMonth() + 1;
+  const month = monthNum <= 9 ? String(monthNum) : monthNum === 10 ? 'O' : monthNum === 11 ? 'N' : 'D';
   const day = d.getDate().toString().padStart(2, "0");
-  
+
   return `NSE:NIFTY${year}${month}${day}${strike}${direction}`;
 }

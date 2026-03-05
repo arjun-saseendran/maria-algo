@@ -21,6 +21,7 @@ import { DailyStatus }  from "./models/traficLightDailyStatusModel.js";
 // ─── Services & Strategy ──────────────────────────────────────────────────────
 import { resetDailyState, tradeState }      from "./state/traficLightTradeState.js";
 import { scanAndSyncOrders, condorPrices }  from "./Engines/ironCondorEngine.js";
+import { setIO as setTrafficIO }               from "./Engines/traficLightEngine.js";
 import { loadTokenFromDisk }                from "./config/kiteConfig.js";
 import { setUpstoxAccessToken }             from "./config/upstoxConfig.js";
 import { sendTelegramAlert }                from "./services/telegramService.js";
@@ -42,6 +43,7 @@ app.use(express.json());
 
 const io = new Server(server, { cors: { origin: "*" } });
 app.set("io", io);
+setTrafficIO(io);
 
 io.on("connection", (socket) => {
   socket.on("market_tick", (data) => { if (data?.price) lastTLLTP = data.price; });
@@ -77,14 +79,16 @@ app.get("/api/condor/positions", async (req, res) => {
       call: {
         entry:    activeTrade.callSpreadEntryPremium.toFixed(2),
         current:  currentCallNet.toFixed(2),
-        sl:       (activeTrade.callSpreadEntryPremium * 4).toFixed(2),
-        profit70: (activeTrade.callSpreadEntryPremium * 0.3).toFixed(2)
+        sl:         (activeTrade.callSpreadEntryPremium * 4).toFixed(2),
+        firefight:  (activeTrade.callSpreadEntryPremium * 3).toFixed(2),
+        profit70:   (activeTrade.callSpreadEntryPremium * 0.3).toFixed(2)
       },
       put: {
-        entry:    activeTrade.putSpreadEntryPremium.toFixed(2),
-        current:  currentPutNet.toFixed(2),
-        sl:       (activeTrade.putSpreadEntryPremium * 4).toFixed(2),
-        profit70: (activeTrade.putSpreadEntryPremium * 0.3).toFixed(2)
+        entry:      activeTrade.putSpreadEntryPremium.toFixed(2),
+        current:    currentPutNet.toFixed(2),
+        sl:         (activeTrade.putSpreadEntryPremium * 4).toFixed(2),
+        firefight:  (activeTrade.putSpreadEntryPremium * 3).toFixed(2),
+        profit70:   (activeTrade.putSpreadEntryPremium * 0.3).toFixed(2)
       }
     }]);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -100,11 +104,18 @@ app.get("/api/traffic/status", (req, res) => {
     livePnL = points * 65;
   }
   res.json({
-    signal:       tradeState?.tradeActive ? "ACTIVE" : tradeState?.tradeTakenToday ? "CLOSED" : "WAITING",
-    entryPrice:   tradeState?.entryPrice?.toFixed(2) || "0.00",
-    livePnL:      livePnL.toFixed(2),
-    breakoutHigh: tradeState?.breakoutHigh || 0,
-    breakoutLow:  tradeState?.breakoutLow  || 0,
+    signal:         tradeState?.tradeActive ? "ACTIVE" : tradeState?.tradeTakenToday ? "CLOSED" : "WAITING",
+    direction:      tradeState?.direction    || null,
+    entryPrice:     tradeState?.entryPrice   || 0,
+    livePnL:        livePnL.toFixed(2),
+    stopLoss:       tradeState?.trailingActive
+                      ? (tradeState?.trailSL?.toFixed(2) || "0.00")
+                      : tradeState?.direction === "CE"
+                        ? (tradeState?.breakoutLow?.toFixed(2)  || "0.00")
+                        : (tradeState?.breakoutHigh?.toFixed(2) || "0.00"),
+    trailingActive: tradeState?.trailingActive || false,
+    breakoutHigh:   tradeState?.breakoutHigh || 0,
+    breakoutLow:    tradeState?.breakoutLow  || 0,
   });
 });
 

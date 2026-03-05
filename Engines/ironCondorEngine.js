@@ -8,6 +8,12 @@ import ActiveTrade from '../models/ironCondorActiveTradeModel.js';
 import TradePerformance from '../models/condorTradePerformanceModel.js';
 import dotenv from 'dotenv';
 
+const emitLog = (msg, level = "info") => {
+  console.log(msg);
+  const io = getIO();
+  if (io) io.emit("trade_log", { msg, level, strategy: "CONDOR", time: new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" }) });
+};
+
 dotenv.config();
 
 // ==========================================
@@ -52,7 +58,7 @@ const fetchHistoricalBuffer = async (index, lotSize) => {
             .limit(20);
 
         if (!recentTrades || recentTrades.length === 0) {
-            console.log(`ℹ️ No trade history for ${index}. Buffer = 0`);
+            emitLog(`ℹ️ No trade history for ${index}. Buffer = 0`, "info");
             return 0;
         }
 
@@ -70,17 +76,17 @@ const fetchHistoricalBuffer = async (index, lotSize) => {
         let cycleProfit = 0;
         for (const trade of recentTrades) {
             if (trade.exitReason === 'STOP_LOSS_HIT') {
-                console.log(`🛑 Buffer boundary: SL hit on trade ${trade.activeTradeId} (${trade.createdAt.toDateString()}). Stopping.`);
+                emitLog(`🛑 Buffer boundary: SL hit on trade ${trade.activeTradeId} (${trade.createdAt.toDateString()}). Stopping.`, "info");
                 break;
             }
             if (trade.exitReason === 'PROFIT_TARGET' || trade.exitReason === 'MANUAL_CLOSE') {
                 cycleProfit += trade.realizedPnL;
-                console.log(`  ✅ Including trade ${trade.activeTradeId}: +₹${trade.realizedPnL.toFixed(2)}`);
+                emitLog(`  ✅ Including trade ${trade.activeTradeId}: +₹${trade.realizedPnL.toFixed(2)}`, "info");
             }
         }
 
         const bufferPoints = Math.max(0, cycleProfit / lotSize);
-        console.log(`💰 Cycle buffer for ${index}: ₹${cycleProfit.toFixed(2)} = ${bufferPoints.toFixed(2)} pts`);
+        emitLog(`💰 Cycle buffer for ${index}: ₹${cycleProfit.toFixed(2)} = ${bufferPoints.toFixed(2)} pts`, "info");
 
         if (bufferPoints > 0) {
             sendCondorAlert(
@@ -90,12 +96,12 @@ const fetchHistoricalBuffer = async (index, lotSize) => {
                 `Buffer Points: ${bufferPoints.toFixed(2)}`
             );
         } else {
-            console.log(`ℹ️ Last trade was SL or no profits in current cycle. Buffer = 0`);
+            emitLog(`ℹ️ Last trade was SL or no profits in current cycle. Buffer = 0`, "info");
         }
 
         return bufferPoints;
     } catch (err) {
-        console.error('❌ Error fetching historical buffer:', err.message);
+        emitLog(`❌ Error fetching historical buffer:: ${err.message}`, "error");
         return 0;
     }
 };
@@ -315,7 +321,7 @@ export const scanForRoll = async (trade, liveSpotPrice) => {
         if (suggestedRoll) io.emit('roll_suggestion', suggestedRoll);
 
     } catch (err) {
-        console.error('❌ Roll Radar Error:', err.message);
+        emitLog(`❌ Roll Radar Error:: ${err.message}`, "error");
     }
 };
 
@@ -339,7 +345,7 @@ export const scanAndSyncOrders = async () => {
 
         // --- 🏁 TRADE COMPLETION (all positions closed) ---
         if (activeIndexPositions.length === 0 && activeTrade) {
-            console.log(`🏁 All positions closed. Finalizing trade...`);
+            emitLog(`🏁 All positions closed. Finalizing trade...`, "info");
             const totalPnL = positions.net
                 .filter(p => p.tradingsymbol.startsWith(index))
                 .reduce((sum, p) => sum + p.pnl, 0);
@@ -353,7 +359,7 @@ export const scanAndSyncOrders = async () => {
                     notes: `Strategy: Iron Condor/Butterfly | Final P&L: ₹${totalPnL.toFixed(2)}`
                 });
             } catch (dbErr) {
-                console.error('❌ History Archive Error:', dbErr.message);
+                emitLog(`❌ History Archive Error:: ${dbErr.message}`, "error");
             }
 
             activeTrade.status = 'COMPLETED';
@@ -403,7 +409,7 @@ export const scanAndSyncOrders = async () => {
             (!lastTrade || lastTrade.status === 'COMPLETED');
 
         if (shouldCreateNew) {
-            console.log(`🆕 New positions detected for ${index}. Creating new ActiveTrade...`);
+            emitLog(`🆕 New positions detected for ${index}. Creating new ActiveTrade...`, "info");
 
             // Load buffer from MongoDB — includes all previous PROFIT_TARGET trades
             const historicalBuffer = await fetchHistoricalBuffer(index, lotSize);
@@ -418,7 +424,7 @@ export const scanAndSyncOrders = async () => {
             // Total buffer = historical (from MongoDB) + today's intraday booked profit
             const totalBuffer = historicalBuffer + todayBuffer;
 
-            console.log(`📊 Buffer breakdown: Historical=${historicalBuffer.toFixed(2)} + Today=${todayBuffer.toFixed(2)} = Total=${totalBuffer.toFixed(2)}`);
+            emitLog(`📊 Buffer breakdown: Historical=${historicalBuffer.toFixed(2)} + Today=${todayBuffer.toFixed(2)} = Total=${totalBuffer.toFixed(2)}`, "info");
 
             const newTrade = await ActiveTrade.create({
                 index,
@@ -446,7 +452,7 @@ export const scanAndSyncOrders = async () => {
                 }
             });
 
-            console.log(`✅ New ActiveTrade created: ${newTrade._id}`);
+            emitLog(`✅ New ActiveTrade created: ${newTrade._id}`, "info");
             sendCondorAlert(
                 `🆕 <b>New Iron Condor Detected: ${index}</b>\n` +
                 `Type: ${tradeType}\n` +
@@ -495,6 +501,6 @@ export const scanAndSyncOrders = async () => {
         }
 
     } catch (err) {
-        console.error('❌ Order Monitor Sync Error:', err.message);
+        emitLog(`❌ Order Monitor Sync Error:: ${err.message}`, "error");
     }
 };
