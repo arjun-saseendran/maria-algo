@@ -4,7 +4,7 @@ import { getIO } from '../config/socket.js';
 import { sendCondorAlert } from '../services/telegramService.js';
 import { executeMarketExit, executeMarginSafeEntry } from '../services/IronCodorOrderService.js';
 import { kiteToFyersSymbol, getFyersIndexSymbol } from '../services/fyersSymbolMapper.js';
-import { getActiveTradeModel } from '../models/ironCondorActiveTradeModel.js';
+import  getActiveTradeModel  from '../models/ironCondorActiveTradeModel.js';
 import { getCondorTradePerformanceModel } from '../models/condorTradePerformanceModel.js';
 import dotenv from 'dotenv';
 
