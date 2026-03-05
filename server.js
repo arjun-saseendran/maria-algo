@@ -14,7 +14,7 @@ import optionsRoutes  from "./routes/optionChainRoutes.js";
 import positionRoutes from "./routes/ironCondorPositionRoutes.js";
 
 // ─── Models ───────────────────────────────────────────────────────────────────
-import ActiveTrade      from "./models/ironCondorActiveTradeModel.js";
+import getActiveTradeModel      from "./models/ironCondorActiveTradeModel.js";
 import TradePerformance from "./models/trafficTradePerformanceModel.js";
 import { DailyStatus }  from "./models/traficLightDailyStatusModel.js";
 
