@@ -9,6 +9,7 @@ import cron from "node-cron";
 import { connectDatabases }  from "./config/db.js";
 import authRoutes            from "./routes/authRoutes.js";
 import tradeRoutes           from "./routes/ironCondorTradeRoutes.js";
+import autoCondorRoutes      from "./routes/autoCondorRoutes.js";
 import optionsRoutes         from "./routes/optionChainRoutes.js";
 import positionRoutes        from "./routes/ironCondorPositionRoutes.js";
 
@@ -20,20 +21,25 @@ import { DailyStatus }       from "./models/traficLightDailyStatusModel.js";
 // ─── Services & Strategy ──────────────────────────────────────────────────────
 import { resetDailyState, tradeState }     from "./state/traficLightTradeState.js";
 import { scanAndSyncOrders, condorPrices } from "./Engines/ironCondorEngine.js";
+import { resetAutoCondorDay }              from "./Engines/autoCondorEngine.js";
 import { setIO as setTrafficIO }           from "./Engines/traficLightEngine.js";
 import { loadTokenFromDisk }               from "./config/kiteConfig.js";
 import { setUpstoxAccessToken }            from "./config/upstoxConfig.js";
 import { sendTelegramAlert }               from "./services/telegramService.js";
 
 // ─── Live Data ────────────────────────────────────────────────────────────────
-// Traffic Light  → Fyers socket (unchanged)
-// Iron Condor    → Upstox socket (replaces Fyers for condor price updates)
-import { initFyersLiveData }  from "./services/fyersLiveData.js";
-import { initUpstoxLiveData } from "./services/upstoxLiveData.js";
+import { initFyersLiveData }                         from "./services/fyersLiveData.js";
+import { initUpstoxLiveData, subscribeCondorSymbol } from "./services/upstoxLiveData.js";
+// ✅ FIX: import subscribeCondorSymbol so new IC legs get subscribed after position sync
 
-// ─── Symbol mapper (Upstox) ───────────────────────────────────────────────────
-// condorPrices cache is now keyed by Upstox instrument keys
+// ─── Symbol mapper ────────────────────────────────────────────────────────────
 import { kiteToUpstoxSymbol } from "./services/upstoxSymbolMapper.js";
+
+// ✅ FIX: import setIO from socket.js so getIO() works in all engines.
+// server.js creates its own `io = new Server(...)` but never called initSocket(),
+// so socket.js `io` var was never set — getIO() returned null everywhere,
+// meaning no events were ever emitted to the dashboard.
+import { setIO as setSocketIO } from "./config/socket.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 const app    = express();
@@ -42,16 +48,25 @@ let lastTLLTP = 0;
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 app.use(cors({
-  origin: ["https://mariaalgo.online", "http://localhost:3000", "http://localhost:5173"],
-  credentials: true,
-  methods: ["GET", "POST", "OPTIONS"],
+  origin:         ["https://mariaalgo.online", "http://localhost:3000", "http://localhost:5173"],
+  credentials:    true,
+  methods:        ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
 }));
 app.use(express.json());
 
 // ─── Socket.IO ────────────────────────────────────────────────────────────────
-const io = new Server(server, { cors: { origin: "*" } });
-app.set("io", io);
+const io = new Server(server, {
+  cors: {
+    origin:      ["https://mariaalgo.online", "http://localhost:3000", "http://localhost:5173"],
+    methods:     ["GET", "POST"],
+    credentials: true,
+  },
+});
+
+// ✅ FIX: register io into socket.js shared module — must happen before live data inits
+// so getIO() returns the correct instance in ironCondorEngine, autoCondorEngine, upstoxLiveData
+setSocketIO(io);
 setTrafficIO(io);
 
 io.on("connection", (socket) => {
@@ -59,10 +74,11 @@ io.on("connection", (socket) => {
 });
 
 // ─── API ROUTES ───────────────────────────────────────────────────────────────
-app.use("/api/auth",      authRoutes);
-app.use("/api/trades",    tradeRoutes);
-app.use("/api/options",   optionsRoutes);
-app.use("/api/positions", positionRoutes);
+app.use("/api/auth",         authRoutes);
+app.use("/api/trades",       tradeRoutes);
+app.use("/api/options",      optionsRoutes);
+app.use("/api/positions",    positionRoutes);
+app.use("/api/auto-condor",  autoCondorRoutes);
 
 // ── 1. Iron Condor Live Positions ─────────────────────────────────────────────
 app.get("/api/condor/positions", async (req, res) => {
@@ -73,7 +89,6 @@ app.get("/api/condor/positions", async (req, res) => {
 
     const activeTrade = await ActiveTrade.findOne({ status: "ACTIVE" });
 
-    // No active trade — return last completed trade for dashboard
     if (!activeTrade) {
       const lastTrade = await ActiveTrade.findOne({ status: "COMPLETED" }).sort({ updatedAt: -1 });
       if (!lastTrade) return res.json([]);
@@ -84,15 +99,22 @@ app.get("/api/condor/positions", async (req, res) => {
         totalPnL:   lastPerf?.realizedPnL?.toFixed(2) || "0.00",
         exitReason: lastPerf?.exitReason || "COMPLETED",
         quantity:   lastTrade.lotSize,
-        call: { entry: lastTrade.callSpreadEntryPremium?.toFixed(2) || "0.00", current: "0.00", sl: "0.00", firefight: "0.00", profit70: "0.00" },
-        put:  { entry: lastTrade.putSpreadEntryPremium?.toFixed(2)  || "0.00", current: "0.00", sl: "0.00", firefight: "0.00", profit70: "0.00" },
+        call: {
+          entry:          lastTrade.callSpreadEntryPremium?.toFixed(2) || "0.00",
+          current:        "0.00",
+          sl:             "0.00",
+          firefightLevel: "0.00",
+        },
+        put: {
+          entry:          lastTrade.putSpreadEntryPremium?.toFixed(2) || "0.00",
+          current:        "0.00",
+          sl:             "0.00",
+          firefightLevel: "0.00",
+        },
       }]);
     }
 
     const idx = activeTrade.index;
-
-    // condorPrices is keyed by Upstox instrument key (set by upstoxLiveData.js)
-    // kiteToUpstoxSymbol converts the Kite symbols stored in DB to Upstox keys
     const getLtp = (sym) => sym ? (condorPrices[kiteToUpstoxSymbol(sym, idx)] || 0) : 0;
 
     const currentCallNet = activeTrade.symbols.callSell
@@ -106,23 +128,44 @@ app.get("/api/condor/positions", async (req, res) => {
       ((activeTrade.callSpreadEntryPremium - currentCallNet) +
        (activeTrade.putSpreadEntryPremium  - currentPutNet)) * activeTrade.lotSize;
 
+    const buffer = activeTrade.bufferPremium || 0;
+
+    // ✅ FIX: SL must match engine formula: min((entry × 4) + buffer, spreadDist/2)
+    // Was: entry × 4  — missing buffer addend and the spread/2 hard cap
+    const spreadDist  = idx === 'SENSEX'
+      ? parseInt(process.env.SENSEX_SPREAD_DISTANCE || '500')
+      : parseInt(process.env.NIFTY_SPREAD_DISTANCE  || '150');
+    const maxSpreadSL = spreadDist / 2;
+    const callSL      = Math.min((activeTrade.callSpreadEntryPremium * 4) + buffer, maxSpreadSL);
+    const putSL       = Math.min((activeTrade.putSpreadEntryPremium  * 4) + buffer, maxSpreadSL);
+
+    // ✅ FIX: firefightLevel = entry × 0.30
+    // Was two separate fields: `firefight` (entry × 3 — completely wrong value,
+    // that's the auto-engine's losing-side threshold) and `profit70` (entry × 0.30).
+    // The dashboard banner fires when net premium decays TO this level (30% of entry).
+    const callFirefightLevel = activeTrade.callSpreadEntryPremium * 0.30;
+    const putFirefightLevel  = activeTrade.putSpreadEntryPremium  * 0.30;
+
     res.json([{
-      index:    activeTrade.index,
-      totalPnL: totalPnL.toFixed(2),
-      quantity: activeTrade.lotSize,
+      index:         activeTrade.index,
+      totalPnL:      totalPnL.toFixed(2),
+      quantity:      activeTrade.lotSize,
+      bufferPremium: buffer.toFixed(2),
+      isButterfly:   activeTrade.isIronButterfly || false,
+      spreadSLCount: activeTrade.spreadSLCount   || 0,
+      circleNumber:  activeTrade.circleNumber    || 1,
+      butterflySL:   ((activeTrade.totalEntryPremium * 3) + buffer).toFixed(2),
       call: {
-        entry:     activeTrade.callSpreadEntryPremium.toFixed(2),
-        current:   currentCallNet.toFixed(2),
-        sl:        (activeTrade.callSpreadEntryPremium * 4).toFixed(2),
-        firefight: (activeTrade.callSpreadEntryPremium * 3).toFixed(2),
-        profit70:  (activeTrade.callSpreadEntryPremium * 0.3).toFixed(2),
+        entry:          activeTrade.callSpreadEntryPremium.toFixed(2),
+        current:        currentCallNet.toFixed(2),
+        sl:             callSL.toFixed(2),
+        firefightLevel: callFirefightLevel.toFixed(2),
       },
       put: {
-        entry:     activeTrade.putSpreadEntryPremium.toFixed(2),
-        current:   currentPutNet.toFixed(2),
-        sl:        (activeTrade.putSpreadEntryPremium * 4).toFixed(2),
-        firefight: (activeTrade.putSpreadEntryPremium * 3).toFixed(2),
-        profit70:  (activeTrade.putSpreadEntryPremium * 0.3).toFixed(2),
+        entry:          activeTrade.putSpreadEntryPremium.toFixed(2),
+        current:        currentPutNet.toFixed(2),
+        sl:             putSL.toFixed(2),
+        firefightLevel: putFirefightLevel.toFixed(2),
       },
     }]);
 
@@ -141,9 +184,11 @@ app.get("/api/traffic/status", (req, res) => {
     livePnL = points * 65;
   }
   res.json({
-    signal:         tradeState?.tradeActive ? "ACTIVE" : tradeState?.tradeTakenToday ? "CLOSED" : "WAITING",
-    direction:      tradeState?.direction   || null,
-    entryPrice:     tradeState?.entryPrice  || 0,
+    signal:         tradeState?.tradeActive    ? "ACTIVE"
+                  : tradeState?.tradeTakenToday ? "CLOSED"
+                  : "WAITING",
+    direction:      tradeState?.direction      || null,
+    entryPrice:     tradeState?.entryPrice     || 0,
     livePnL:        livePnL.toFixed(2),
     stopLoss:       tradeState?.trailingActive
                       ? (tradeState?.trailSL?.toFixed(2)       || "0.00")
@@ -153,6 +198,8 @@ app.get("/api/traffic/status", (req, res) => {
     trailingActive: tradeState?.trailingActive || false,
     breakoutHigh:   tradeState?.breakoutHigh   || 0,
     breakoutLow:    tradeState?.breakoutLow    || 0,
+    // ✅ FIX: exitReason added — was missing from response, always appeared null on dashboard
+    exitReason:     tradeState?.exitReason     || null,
   });
 });
 
@@ -183,25 +230,17 @@ app.get("/status", (req, res) =>
   res.json({ status: "Online", timestamp: new Date() })
 );
 
-// ─── GLOBAL ERROR HANDLERS — alert via Telegram on crash ─────────────────────
+// ─── GLOBAL ERROR HANDLERS ────────────────────────────────────────────────────
 process.on("uncaughtException", async (err) => {
   console.error("💥 Uncaught Exception:", err.message);
-  try {
-    await sendTelegramAlert(
-      `💥 <b>Server Crash: Uncaught Exception</b>\n<code>${err.message}</code>`
-    );
-  } catch (_) {}
+  try { await sendTelegramAlert(`💥 <b>Server Crash: Uncaught Exception</b>\n<code>${err.message}</code>`); } catch (_) {}
   process.exit(1);
 });
 
 process.on("unhandledRejection", async (reason) => {
   const msg = reason instanceof Error ? reason.message : String(reason);
   console.error("💥 Unhandled Rejection:", msg);
-  try {
-    await sendTelegramAlert(
-      `⚠️ <b>Unhandled Rejection</b>\n<code>${msg}</code>`
-    );
-  } catch (_) {}
+  try { await sendTelegramAlert(`⚠️ <b>Unhandled Rejection</b>\n<code>${msg}</code>`); } catch (_) {}
 });
 
 // ─── STARTUP ──────────────────────────────────────────────────────────────────
@@ -209,14 +248,12 @@ const start = async () => {
   try {
     await connectDatabases();
 
-    // Load broker tokens saved by login.sh at 8:00 AM
     await loadTokenFromDisk();
     if (process.env.UPSTOX_ACCESS_TOKEN) {
       setUpstoxAccessToken(process.env.UPSTOX_ACCESS_TOKEN);
       console.log("✅ Upstox token loaded");
     }
 
-    // Restore Traffic Light daily state from DB
     const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(new Date());
     const dailyRecord = await DailyStatus.findOne({ date: today });
     if (dailyRecord) {
@@ -230,7 +267,6 @@ const start = async () => {
       console.log(`🚀 Maria Algo Server Online · port ${PORT}`);
       await sendTelegramAlert("🤖 <b>Maria Algo Online! ✅</b>");
 
-      // ── Traffic Light: Fyers socket (unchanged) ───────────────────────────
       if (process.env.FYERS_ACCESS_TOKEN) {
         await initFyersLiveData();
         console.log("✅ Fyers live data started (Traffic Light)");
@@ -238,7 +274,6 @@ const start = async () => {
         console.warn("⚠️ FYERS_ACCESS_TOKEN missing — Traffic Light will not receive live data");
       }
 
-      // ── Iron Condor: Upstox socket (replaces Fyers for condor prices) ─────
       if (process.env.UPSTOX_ACCESS_TOKEN) {
         await initUpstoxLiveData();
         console.log("✅ Upstox live data started (Iron Condor)");
@@ -246,9 +281,24 @@ const start = async () => {
         console.warn("⚠️ UPSTOX_ACCESS_TOKEN missing — Iron Condor will not receive live data");
       }
 
-      // ── Iron Condor position sync — every 60 seconds ─────────────────────
+      // ✅ FIX: after scanAndSyncOrders creates a new ActiveTrade, subscribe its
+      // option leg symbols to the Upstox feed. Without this, new legs detected by
+      // the position sync are never added to the WS subscription — condorPrices
+      // never receives ticks for them and SL monitoring stays blind.
       setInterval(async () => {
-        try { await scanAndSyncOrders(); } catch (err) {
+        try {
+          await scanAndSyncOrders();
+
+          const ActiveTrade = getActiveTradeModel();
+          const active = await ActiveTrade.findOne({ status: 'ACTIVE' });
+          if (active) {
+            const idx = active.index;
+            [active.symbols.callSell, active.symbols.callBuy,
+             active.symbols.putSell,  active.symbols.putBuy]
+              .filter(Boolean)
+              .forEach(kite => subscribeCondorSymbol(kiteToUpstoxSymbol(kite, idx)));
+          }
+        } catch (err) {
           console.error("❌ scanAndSyncOrders error:", err.message);
         }
       }, 60000);
@@ -260,8 +310,10 @@ const start = async () => {
   }
 };
 
-// ─── CRON ─────────────────────────────────────────────────────────────────────
-// Reset Traffic Light state at 9:00 AM IST every weekday
-cron.schedule("0 9 * * 1-5", () => resetDailyState(), { timezone: "Asia/Kolkata" });
+// ─── CRON — Reset at 9:00 AM IST every weekday ───────────────────────────────
+cron.schedule("0 9 * * 1-5", () => {
+  resetDailyState();
+  resetAutoCondorDay();
+}, { timezone: "Asia/Kolkata" });
 
 start();

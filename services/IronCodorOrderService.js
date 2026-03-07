@@ -1,33 +1,46 @@
 import { getKiteInstance } from '../config/kiteConfig.js';
 import { sendCondorAlert } from '../services/telegramService.js';
 import dotenv from 'dotenv';
-
 dotenv.config();
 
 /**
  * 🛡️ UNIVERSAL MARGIN-SAFE EXIT
- * Exits shorts first (reduces margin), then longs.
- * Integrated with LIVE_TRADING safety toggle.
+ *
+ * exitSide controls which legs to exit:
+ *   'FULL' (default) → exit all 4 legs (both spreads)
+ *   'CALL'           → exit call spread only (callSell + callBuy)
+ *   'PUT'            → exit put spread only (putSell + putBuy)
+ *   'BOTH'           → same as 'FULL' (Iron Butterfly full exit)
+ *
+ * ✅ FIX: engines call executeMarketExit(trade, exitSide) — second param was ignored.
+ *         Partial exits (RESET after 1 SL) now correctly exit only the breached side.
+ *
+ * Sequence: exit shorts first (reduces margin), then longs.
  */
-export const executeMarketExit = async (trade) => {
-    const kc = getKiteInstance();
+export const executeMarketExit = async (trade, exitSide = 'FULL') => {
+    const kc       = getKiteInstance();
     const exchange = trade.index === 'SENSEX' ? 'BFO' : 'NFO';
-    const isLive = process.env.LIVE_TRADING === 'true';
+    const isLive   = process.env.LIVE_TRADING === 'true';
+    const side     = exitSide?.toUpperCase() || 'FULL';
 
-    console.log(`🚨 [EXECUTION] ${isLive ? 'LIVE' : 'PAPER'} Exit Triggered for ${trade.index}`);
+    console.log(`🚨 [EXECUTION] ${isLive ? 'LIVE' : 'PAPER'} Exit | ${trade.index} | Side: ${side}`);
+
+    // Build leg lists based on exitSide
+    const includeCall = side === 'FULL' || side === 'BOTH' || side === 'CALL';
+    const includePut  = side === 'FULL' || side === 'BOTH' || side === 'PUT';
+
+    const shortLegs = [
+        includeCall && trade.symbols.callSell ? { symbol: trade.symbols.callSell } : null,
+        includePut  && trade.symbols.putSell  ? { symbol: trade.symbols.putSell  } : null,
+    ].filter(Boolean);
+
+    const longLegs = [
+        includeCall && trade.symbols.callBuy ? { symbol: trade.symbols.callBuy } : null,
+        includePut  && trade.symbols.putBuy  ? { symbol: trade.symbols.putBuy  } : null,
+    ].filter(Boolean);
 
     try {
-        const shortLegs = [
-            { symbol: trade.symbols.callSell },
-            { symbol: trade.symbols.putSell  }
-        ].filter(leg => leg.symbol);
-
-        const longLegs = [
-            { symbol: trade.symbols.callBuy },
-            { symbol: trade.symbols.putBuy  }
-        ].filter(leg => leg.symbol);
-
-        // --- PHASE 1: EXIT SHORTS (buy to cover) ---
+        // PHASE 1: EXIT SHORTS (buy to cover) — frees margin first
         for (const leg of shortLegs) {
             if (!isLive) {
                 console.log(`📝 [PAPER] BUY (Cover) ${trade.lotSize} ${leg.symbol}`);
@@ -39,13 +52,13 @@ export const executeMarketExit = async (trade) => {
                     transaction_type: 'BUY',
                     quantity:         trade.lotSize,
                     order_type:       'MARKET',
-                    product:          'NRML'
+                    product:          'NRML',
                 });
                 console.log(`✅ Short closed: ${leg.symbol}`);
             }
         }
 
-        // --- PHASE 2: EXIT LONGS (sell to close) ---
+        // PHASE 2: EXIT LONGS (sell to close)
         for (const leg of longLegs) {
             if (!isLive) {
                 console.log(`📝 [PAPER] SELL (Close) ${trade.lotSize} ${leg.symbol}`);
@@ -57,7 +70,7 @@ export const executeMarketExit = async (trade) => {
                     transaction_type: 'SELL',
                     quantity:         trade.lotSize,
                     order_type:       'MARKET',
-                    product:          'NRML'
+                    product:          'NRML',
                 });
                 console.log(`✅ Long closed: ${leg.symbol}`);
             }
@@ -65,7 +78,8 @@ export const executeMarketExit = async (trade) => {
 
         await sendCondorAlert(
             `✅ <b>Exit Complete: ${trade.index}</b>\n` +
-            `Mode: ${isLive ? 'LIVE' : 'PAPER'}\n` +
+            `Side: ${side}\n` +
+            `Mode: ${isLive ? 'LIVE 🔴' : 'PAPER 📝'}\n` +
             `Legs closed: ${shortLegs.length + longLegs.length}`
         );
 
@@ -75,6 +89,7 @@ export const executeMarketExit = async (trade) => {
         console.error('❌ CRITICAL ORDER FAILURE:', error.message);
         await sendCondorAlert(
             `🚨 <b>EXIT FAILURE: ${trade.index}</b>\n` +
+            `Side: ${side}\n` +
             `Error: ${error.message}\n` +
             `⚠️ Manual intervention required!`
         );
@@ -84,13 +99,13 @@ export const executeMarketExit = async (trade) => {
 
 /**
  * 🚀 MARGIN-SAFE ENTRY / ROLL
- * Buy long first (no margin risk), then sell short.
- * Used for one-click roll adjustments.
+ * Buy long first (no margin spike), then sell short.
+ * Used for entries and one-click roll adjustments.
  */
 export const executeMarginSafeEntry = async (buySymbol, sellSymbol, quantity, index) => {
-    const kc = getKiteInstance();
+    const kc       = getKiteInstance();
     const exchange = index === 'SENSEX' ? 'BFO' : 'NFO';
-    const isLive = process.env.LIVE_TRADING === 'true';
+    const isLive   = process.env.LIVE_TRADING === 'true';
 
     try {
         if (!isLive) {
@@ -106,7 +121,7 @@ export const executeMarginSafeEntry = async (buySymbol, sellSymbol, quantity, in
             transaction_type: 'BUY',
             quantity,
             order_type:       'MARKET',
-            product:          'NRML'
+            product:          'NRML',
         });
         console.log(`✅ Long leg placed: ${buySymbol}`);
 
@@ -118,7 +133,7 @@ export const executeMarginSafeEntry = async (buySymbol, sellSymbol, quantity, in
             transaction_type: 'SELL',
             quantity,
             order_type:       'MARKET',
-            product:          'NRML'
+            product:          'NRML',
         });
         console.log(`✅ Short leg placed: ${sellSymbol}`);
 

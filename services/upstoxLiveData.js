@@ -8,16 +8,10 @@
  *   fyersLiveData.js  → NIFTY spot tick → Traffic Light engine (unchanged)
  *   upstoxLiveData.js → NIFTY/SENSEX spot + IC option legs → Iron Condor engine
  *
- * Why Upstox for Iron Condor?
- *   Fyers quote API couldn't reliably return full option chain data.
- *   Upstox WebSocket gives proper streaming for index spot + option legs.
- *
  * Symbol format used internally for condorPrices cache:
  *   Upstox instrument key format: "NSE_INDEX|Nifty 50", "NSE_FO|NIFTY10MAR202522500CE"
- *   These keys are what Upstox sends back in tick messages.
- *
- * Iron Condor engine (monitorCondorLevels) calls:
- *   condorPrices[kiteToUpstoxSymbol(sym, idx)]  — must match this key format exactly.
+ *   These keys are what Upstox sends back in tick messages and what
+ *   monitorCondorLevels looks up via kiteToUpstoxSymbol().
  */
 
 import pkg from 'upstox-js-sdk';
@@ -27,40 +21,49 @@ import {
   updateCondorPrice,
   monitorCondorLevels,
 } from '../Engines/ironCondorEngine.js';
+// ✅ FIX: use lazy getter — getActiveTradeModel() not called until after DB connects
 import getActiveTradeModel from '../models/ironCondorActiveTradeModel.js';
 import {
   kiteToUpstoxSymbol,
   getUpstoxIndexSymbol,
-} from './upstoxSymbolMapper.js';
+} from '../services/upstoxSymbolMapper.js';
 
 // ── Upstox websocket instance (kept for dynamic re-subscription) ────────────
-let _upstoxWs     = null;
+let _upstoxWs       = null;
 let _subscribedKeys = new Set();
 
-// ── Upstox WebSocket feed type ───────────────────────────────────────────────
-// "full"  = full market depth + greeks (slower)
-// "ltpc"  = LTP + close only (fastest, enough for SL monitoring)
-const FEED_TYPE = 'ltpc';
+// ── Feed type: ltpc = LTP + close only (fastest, sufficient for SL monitoring) ──
+const FEED_TYPE   = 'ltpc';
 
 // ── Index spot keys ──────────────────────────────────────────────────────────
 const NIFTY_SPOT  = 'NSE_INDEX|Nifty 50';
 const SENSEX_SPOT = 'BSE_INDEX|SENSEX';
 
+// ── monitorCondorLevels throttle ─────────────────────────────────────────────
+// monitorCondorLevels hits MongoDB on every call.
+// Upstox fires ticks for every subscribed symbol — without throttling this
+// would run a DB query hundreds of times per second.
+// ✅ FIX: throttle to once per 500ms regardless of tick volume.
+let _lastMonitorTime = 0;
+const MONITOR_THROTTLE_MS = 500;
+
 /**
- * Dynamically add a new symbol to the live subscription.
- * Called from ironCondorEngine after new positions are detected.
+ * Dynamically add a new Upstox symbol to the live subscription.
+ * ✅ FIX: export is correct — but must be called from scanAndSyncOrders
+ *         after a new ActiveTrade is created so new option legs get subscribed.
  *
  * @param {string} upstoxKey  e.g. "NSE_FO|NIFTY10MAR202522500CE"
  */
 export const subscribeCondorSymbol = (upstoxKey) => {
   if (!upstoxKey || _subscribedKeys.has(upstoxKey)) return;
-  if (!_upstoxWs) {
-    console.warn('⚠️ Upstox WS not ready yet — symbol queued:', upstoxKey);
+  _subscribedKeys.add(upstoxKey);
+
+  if (!_upstoxWs || _upstoxWs.readyState !== 1 /* OPEN */) {
+    console.warn('⚠️ Upstox WS not ready — symbol queued and will be sent on reconnect:', upstoxKey);
     return;
   }
-  _subscribedKeys.add(upstoxKey);
   _sendSubscription([...Array.from(_subscribedKeys)]);
-  console.log(`📡 Upstox: subscribed to ${upstoxKey}`);
+  console.log(`📡 Upstox: dynamically subscribed to ${upstoxKey}`);
 };
 
 // ── Internal: send subscription message ─────────────────────────────────────
@@ -69,48 +72,28 @@ const _sendSubscription = (keys) => {
   const msg = {
     guid:   'condor-sub',
     method: 'sub',
-    data:   {
-      mode:             FEED_TYPE,
-      instrumentKeys:   keys,
-    },
+    data:   { mode: FEED_TYPE, instrumentKeys: keys },
   };
   _upstoxWs.send(JSON.stringify(msg));
 };
 
 /**
- * Parse an Upstox WebSocket tick message.
- *
- * Upstox sends binary protobuf (not JSON). The upstox-js-sdk v2.x does NOT
- * auto-decode — we receive a raw Buffer/ArrayBuffer on the ws.onmessage event.
- * We must decode it using the SDK's MarketDataFeed protobuf decoder.
- *
- * Feed structure after decode:
- *   {
- *     feeds: {
- *       "NSE_INDEX|Nifty 50": { ltpc: { ltp: 24450.55, ... } },
- *       "NSE_FO|NIFTY10MAR202522500CE": { ltpc: { ltp: 223.90 } }
- *     }
- *   }
- *
+ * Parse an Upstox WebSocket tick message (binary protobuf).
  * Returns array of { key, price } objects.
  */
-let _proto = null; // cached protobuf root — loaded once
+let _proto = null;
 
 const parseTick = async (rawMsg) => {
   try {
-    // rawMsg is a Buffer (binary protobuf from Upstox)
-    // If it's a string it's a control/heartbeat message — skip
-    if (typeof rawMsg === 'string') return [];
+    if (typeof rawMsg === 'string') return []; // heartbeat / control frame
 
-    // Lazy-load the protobuf decoder from upstox-js-sdk
     if (!_proto) {
       try {
         const protobuf = (await import('protobufjs')).default;
-        // upstox-js-sdk v2.x ships the proto file at:
         const { createRequire } = await import('module');
         const req = createRequire(import.meta.url);
-        // Try to find the proto file bundled with the SDK
-        const protoPath = req.resolve('upstox-js-sdk').replace('index.js', '')
+        const protoPath = req.resolve('upstox-js-sdk')
+          .replace('index.js', '')
           .replace('src/', '') + 'MarketDataFeed.proto';
         _proto = await protobuf.load(protoPath).catch(() => null);
       } catch (_) {
@@ -119,11 +102,12 @@ const parseTick = async (rawMsg) => {
     }
 
     if (_proto) {
-      // Decode using protobuf
-      const FeedResponse = _proto.lookupType('com.upstox.marketdatafeeder.rpc.proto.FeedResponse');
-      const buf = rawMsg instanceof ArrayBuffer ? Buffer.from(rawMsg) : rawMsg;
+      const FeedResponse = _proto.lookupType(
+        'com.upstox.marketdatafeeder.rpc.proto.FeedResponse'
+      );
+      const buf     = rawMsg instanceof ArrayBuffer ? Buffer.from(rawMsg) : rawMsg;
       const decoded = FeedResponse.decode(buf);
-      const data = FeedResponse.toObject(decoded, { longs: Number, defaults: true });
+      const data    = FeedResponse.toObject(decoded, { longs: Number, defaults: true });
 
       if (!data?.feeds) return [];
       return Object.entries(data.feeds)
@@ -134,7 +118,7 @@ const parseTick = async (rawMsg) => {
         .filter(Boolean);
     }
 
-    // Fallback: try JSON parse (for text frames / test environments)
+    // Fallback: JSON text frames (dev/test environments)
     const text = rawMsg.toString('utf8');
     const data = JSON.parse(text);
     if (!data?.feeds) return [];
@@ -145,15 +129,14 @@ const parseTick = async (rawMsg) => {
       })
       .filter(Boolean);
 
-  } catch (err) {
-    // Silently ignore decode errors (heartbeat frames, etc.)
-    return [];
+  } catch {
+    return []; // silently ignore decode errors / heartbeat frames
   }
 };
 
 /**
  * Init the Upstox live data socket for Iron Condor.
- * Called once from server startup (after DB is connected).
+ * Called once from server startup after DB is connected.
  */
 export const initUpstoxLiveData = async () => {
   const token = process.env.UPSTOX_ACCESS_TOKEN;
@@ -163,9 +146,13 @@ export const initUpstoxLiveData = async () => {
   }
 
   const io = getIO();
+
+  // ✅ FIX: call getActiveTradeModel() lazily here (after DB is connected)
+  //         Previously: const ActiveTrade = getActiveTradeModel() at module level
+  //         — this ran before mongoose connected, returning a broken model reference
   const ActiveTrade = getActiveTradeModel();
 
-  console.log('🔌 Connecting to Upstox Live Data Socket...');
+  console.log('🔌 Connecting to Upstox Live Data Socket (Iron Condor)...');
 
   // ── Build initial subscription list ────────────────────────────────────────
   let initialKeys = [NIFTY_SPOT, SENSEX_SPOT];
@@ -173,7 +160,7 @@ export const initUpstoxLiveData = async () => {
   try {
     const activeTrade = await ActiveTrade.findOne({ status: 'ACTIVE' });
     if (activeTrade) {
-      const idx = activeTrade.index;
+      const idx      = activeTrade.index;
       const legSymbols = [
         activeTrade.symbols.callSell,
         activeTrade.symbols.callBuy,
@@ -184,7 +171,9 @@ export const initUpstoxLiveData = async () => {
         .map(kite => kiteToUpstoxSymbol(kite, idx))
         .filter(Boolean);
 
-      initialKeys = [...new Set([...initialKeys, getUpstoxIndexSymbol(idx), ...legSymbols])];
+      initialKeys = [
+        ...new Set([...initialKeys, getUpstoxIndexSymbol(idx), ...legSymbols])
+      ];
     }
   } catch (err) {
     console.error('❌ Upstox: could not load active trade for subscription:', err.message);
@@ -192,37 +181,33 @@ export const initUpstoxLiveData = async () => {
 
   initialKeys.forEach(k => _subscribedKeys.add(k));
 
-  // ── Connect via Upstox v3 REST auth + native WebSocket ────────────────────
-  // The upstox-js-sdk v2.x WebsocketApi still calls the deprecated v2 endpoint.
-  // Fix: call the v3 authorize endpoint directly via fetch, then open the WSS URL.
+  // ── Connect via Upstox v3 authorize endpoint ───────────────────────────────
   try {
     const authRes = await fetch(
       'https://api.upstox.com/v3/feed/market-data-feed/authorize',
       {
         method:  'GET',
         headers: {
-          'Authorization':     `Bearer ${token}`,
-          'Accept':            'application/json',
-          'Api-Version':       '2.0',
+          'Authorization': `Bearer ${token}`,
+          'Accept':        'application/json',
+          'Api-Version':   '2.0',
         },
       }
     );
 
     if (!authRes.ok) {
-      const errBody = await authRes.text();
-      console.error(`❌ Upstox WS auth failed (${authRes.status}):`, errBody);
+      console.error(`❌ Upstox WS auth failed (${authRes.status}):`, await authRes.text());
       return;
     }
 
     const authData = await authRes.json();
-    const wsUrl = authData?.data?.authorizedRedirectUri;
+    const wsUrl    = authData?.data?.authorizedRedirectUri;
 
     if (!wsUrl) {
       console.error('❌ Upstox WS: no authorizedRedirectUri in auth response', authData);
       return;
     }
 
-    // Use native WebSocket (Node 18+ has it globally, else fall back to 'ws')
     const WS = globalThis.WebSocket || (await import('ws')).default;
     const ws = new WS(wsUrl);
     _upstoxWs = ws;
@@ -236,18 +221,23 @@ export const initUpstoxLiveData = async () => {
       const ticks = await parseTick(event.data);
 
       for (const { key, price } of ticks) {
-        // Update the Iron Condor price cache (key is Upstox instrument key)
+        // Update Iron Condor price cache
         updateCondorPrice(key, price);
 
-        // Emit market tick to dashboard for NIFTY spot
+        // Emit NIFTY spot to dashboard
         if (key === NIFTY_SPOT && io) {
           io.emit('market_tick', { price, timestamp: Date.now() });
         }
       }
 
-      // Run Iron Condor SL/decay monitor on every tick batch
+      // ✅ FIX: throttle monitorCondorLevels — was called on EVERY tick batch
+      //         (hundreds of MongoDB queries/sec when many symbols are subscribed)
       if (ticks.length > 0) {
-        await monitorCondorLevels();
+        const now = Date.now();
+        if (now - _lastMonitorTime >= MONITOR_THROTTLE_MS) {
+          _lastMonitorTime = now;
+          await monitorCondorLevels();
+        }
       }
     };
 

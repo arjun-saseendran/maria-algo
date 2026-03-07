@@ -1,16 +1,15 @@
 import { getKiteInstance } from '../config/kiteConfig.js';
-import { getLTP } from '../config/upstoxConfig.js';       // ← Upstox (was Fyers getQuotes)
+import { getLTP } from '../config/upstoxConfig.js';
 import { getIO } from '../config/socket.js';
 import { sendCondorAlert } from '../services/telegramService.js';
 import { executeMarketExit, executeMarginSafeEntry } from '../services/IronCodorOrderService.js';
-import { kiteToUpstoxSymbol, getUpstoxIndexSymbol } from '../services/upstoxSymbolMapper.js'; // ← Upstox mapper
-import  getActiveTradeModel  from '../models/ironCondorActiveTradeModel.js';
+import { kiteToUpstoxSymbol, getUpstoxIndexSymbol } from '../services/upstoxSymbolMapper.js';
+import getActiveTradeModel from '../models/ironCondorActiveTradeModel.js';
 import { getCondorTradePerformanceModel } from '../models/condorTradePerformanceModel.js';
 import dotenv from 'dotenv';
 
-// Lazy getters — models must be accessed after DB is connected
-const ActiveTrade       = () => getActiveTradeModel();
-const TradePerformance  = () => getCondorTradePerformanceModel();
+const ActiveTrade      = () => getActiveTradeModel();
+const TradePerformance = () => getCondorTradePerformanceModel();
 
 const emitLog = (msg, level = "info") => {
   console.log(msg);
@@ -43,39 +42,47 @@ const extractBaseSymbol = (symbol) => {
     return match ? { base: match[1], strike: parseInt(match[2]), type: match[3] } : null;
 };
 
+const getSpreadDistance = (index) =>
+    index === 'SENSEX'
+        ? parseInt(process.env.SENSEX_SPREAD_DISTANCE || 500)
+        : parseInt(process.env.NIFTY_SPREAD_DISTANCE  || 150);
+
+
 // ==========================================
-// 💰 FETCH CYCLE BUFFER FROM MONGODB
-// Walk backwards through history — STOP at last STOP_LOSS_HIT.
-// Only profits from the CURRENT cycle (since last SL) count as buffer.
-// Example (newest first):
-//   PROFIT +400  ← include
-//   PROFIT +200  ← include
-//   SL_HIT -300  ← STOP. Older profits belong to previous cycle.
-//   PROFIT +500  ← ignored
-// Buffer = (400 + 200) / lotSize
+// 💰 2. FETCH CYCLE BUFFER FROM MONGODB
+//
+// STRATEGY CYCLE DEFINITION
+// ─────────────────────────
+// A "cycle" is the sequence of Iron Condor attempts since the last STOP_LOSS_HIT.
+// Walk newest-first through TradePerformance records for this index.
+// Stop at the first STOP_LOSS_HIT — everything before that is a prior cycle.
+//
+// What counts as buffer (booked profit)?
+//   • PROFIT_TARGET exits  → full realizedPnL
+//   • FIREFIGHT exits      → the portion of premium that was locked in during
+//                            the firefight roll (stored as firefightBookedPnL)
+//   • MANUAL_CLOSE exits   → full realizedPnL
+//
+// Buffer is expressed in POINTS = totalBookedProfit / lotSize
+// so it can be added directly to premium-based SL thresholds.
+//
+// The "Iron Condor circle" (which attempt we are in) is determined by counting
+// how many STOP_LOSS_HIT records exist for this index — that is the circle number.
 // ==========================================
 const fetchHistoricalBuffer = async (index, lotSize) => {
     try {
-        // Fetch last 20 trades for this index newest first
         const recentTrades = await TradePerformance().find({ index })
             .sort({ createdAt: -1 })
             .limit(20);
 
         if (!recentTrades || recentTrades.length === 0) {
             emitLog(`ℹ️ No trade history for ${index}. Buffer = 0`, "info");
-            return 0;
+            return { bufferPoints: 0, circleNumber: 1 };
         }
 
-        // Walk backwards. Group by activeTradeId.
-        // Stop the moment we hit a STOP_LOSS_HIT record.
-        // This means:
-        //   - Firefight rolls within the SAME activeTradeId are included together
-        //   - Once any trade (any ID) has a SL hit, we stop — that's the cycle boundary
-        // Example (newest first):
-        //   TradeB: PROFIT +400  ← include (different ID, but still same cycle — no SL yet)
-        //   TradeA: PROFIT +200  ← include
-        //   TradeX: SL_HIT -300  ← STOP. Everything older is a previous cycle.
-        //   TradeW: PROFIT +500  ← ignored
+        // Count total SL hits to know which circle we are in (1-based)
+        const totalSLHits = recentTrades.filter(t => t.exitReason === 'STOP_LOSS_HIT').length;
+        const circleNumber = totalSLHits + 1; // current circle = next after last SL
 
         let cycleProfit = 0;
         for (const trade of recentTrades) {
@@ -83,43 +90,87 @@ const fetchHistoricalBuffer = async (index, lotSize) => {
                 emitLog(`🛑 Buffer boundary: SL hit on trade ${trade.activeTradeId} (${trade.createdAt.toDateString()}). Stopping.`, "info");
                 break;
             }
-            if (trade.exitReason === 'PROFIT_TARGET' || trade.exitReason === 'MANUAL_CLOSE') {
-                cycleProfit += trade.realizedPnL;
-                emitLog(`  ✅ Including trade ${trade.activeTradeId}: +₹${trade.realizedPnL.toFixed(2)}`, "info");
+            if (
+                trade.exitReason === 'PROFIT_TARGET' ||
+                trade.exitReason === 'MANUAL_CLOSE'  ||
+                trade.exitReason === 'FIREFIGHT'
+            ) {
+                // For firefight exits use the specific locked premium if available,
+                // otherwise fall back to realizedPnL
+                const contribution = trade.firefightBookedPnL ?? trade.realizedPnL;
+                cycleProfit += contribution;
+                emitLog(`  ✅ Including trade ${trade.activeTradeId} (${trade.exitReason}): +₹${contribution.toFixed(2)}`, "info");
             }
         }
 
         const bufferPoints = Math.max(0, cycleProfit / lotSize);
-        emitLog(`💰 Cycle buffer for ${index}: ₹${cycleProfit.toFixed(2)} = ${bufferPoints.toFixed(2)} pts`, "info");
+        emitLog(`💰 Cycle buffer for ${index} [Circle #${circleNumber}]: ₹${cycleProfit.toFixed(2)} = ${bufferPoints.toFixed(2)} pts`, "info");
 
         if (bufferPoints > 0) {
             sendCondorAlert(
-                `💰 <b>Buffer Loaded (Cycle Profit)</b>\n` +
+                `💰 <b>Buffer Loaded — Circle #${circleNumber}</b>\n` +
                 `Index: ${index}\n` +
-                `Profit since last SL: ₹${cycleProfit.toFixed(2)}\n` +
+                `Booked profit since last SL: ₹${cycleProfit.toFixed(2)}\n` +
                 `Buffer Points: ${bufferPoints.toFixed(2)}`
             );
         } else {
-            emitLog(`ℹ️ Last trade was SL or no profits in current cycle. Buffer = 0`, "info");
+            emitLog(`ℹ️ No profits in current cycle. Buffer = 0`, "info");
         }
 
-        return bufferPoints;
+        return { bufferPoints, circleNumber };
     } catch (err) {
-        emitLog(`❌ Error fetching historical buffer:: ${err.message}`, "error");
-        return 0;
+        emitLog(`❌ Error fetching historical buffer: ${err.message}`, "error");
+        return { bufferPoints: 0, circleNumber: 1 };
     }
 };
 
+
 // ==========================================
-// 🛡️ 2. LIVE RISK & DECAY MONITOR
+// 🛡️ 3. LIVE RISK & DECAY MONITOR
+//
+// STOP LOSS LOGIC SUMMARY
+// ───────────────────────
+// Spread distance:   NIFTY = 150 pts | SENSEX = 500 pts
+//
+// ── Standard Iron Condor ──
+//   Example entry:  callNet = 6,  putNet = 6,  totalNet = 10 (discount due to overlap)
+//
+//   Iron Condor max loss (gap scenario only — do NOT auto-exit):
+//     maxLoss = spreadDistance - totalEntryPremium + bufferPremium
+//
+//   Per-spread SL (normal market, auto-exit one side):
+//     Firefight threshold = 70% profit on either spread = entryPremium × 0.30
+//     spreadSL = (entryPremium × 4) + firefightBookedBuffer   ← 4× the spread entry
+//     Hard cap: spreadSL must never exceed spreadDistance / 2  (= 75 for NIFTY, 250 for SENSEX)
+//
+//   RESET rule (one spread SL hit):
+//     • Exit only the breached side (1 spread SL consumed)
+//     • Keep the healthy side open
+//     • Reload buffer from MongoDB → this is now a new circle
+//     • Enter a fresh spread on the SL-hit side (handled manually on Kite;
+//       scanAndSyncOrders will detect it and create a new ActiveTrade)
+//     • If 2 spread SLs hit (both sides) → exit ALL positions (max loss)
+//
+// ── Iron Butterfly (defense mode) ──
+//   Triggered when spot reaches a short strike.
+//   The opposite side is rolled to the same ATM strike → 4-leg butterfly.
+//
+//   Butterfly SL = totalIronCondorPremium × 3 + bufferPremium
+//     (uses original Iron Condor combined premium, NOT the butterfly roll premium)
+//
+// ── Gap Scenario (market opens beyond short strike) ──
+//   Max loss is naturally capped by spread width.
+//   Do NOT auto-exit. Hold till expiry or manual close.
+//   (No changes to automated active/exit logic — this is strategy documentation only.)
 // ==========================================
 export const monitorCondorLevels = async () => {
     const activeTrade = await ActiveTrade().findOne({ status: 'ACTIVE' });
     if (!activeTrade) return;
 
-    const idx = activeTrade.index;
-    const getLtp = (sym) => sym ? condorPrices[kiteToUpstoxSymbol(sym, idx)] || 0 : 0;
-    const spotLTP = condorPrices[getUpstoxIndexSymbol(idx)] || 0;
+    const idx      = activeTrade.index;
+    const getLtp   = (sym) => sym ? condorPrices[kiteToUpstoxSymbol(sym, idx)] || 0 : 0;
+    const spotLTP  = condorPrices[getUpstoxIndexSymbol(idx)] || 0;
+    const spread   = getSpreadDistance(idx);
 
     const currentCallNet = activeTrade.symbols.callSell
         ? Math.abs(getLtp(activeTrade.symbols.callSell) - getLtp(activeTrade.symbols.callBuy))
@@ -129,32 +180,89 @@ export const monitorCondorLevels = async () => {
         : 0;
 
     let stateChanged = false;
-    const { isIronButterfly, tradeType, callSpreadEntryPremium, putSpreadEntryPremium, totalEntryPremium, bufferPremium } = activeTrade;
+    const {
+        isIronButterfly,
+        tradeType,
+        callSpreadEntryPremium,
+        putSpreadEntryPremium,
+        totalEntryPremium,
+        bufferPremium,          // booked firefight/profit buffer in points
+        spreadSLCount,          // how many spread SLs consumed this circle (0, 1, or 2)
+    } = activeTrade;
 
-    // --- 🎯 70% DECAY ALERTS ---
-    if (!activeTrade.alertsSent.call70Decay && tradeType !== 'PUT_SPREAD' && currentCallNet > 0 && currentCallNet <= (callSpreadEntryPremium * 0.3)) {
-        sendCondorAlert(`🟢 <b>70% DECAY: ${idx} CALL</b>\nEntry: ₹${callSpreadEntryPremium.toFixed(2)}\nCurrent: ₹${currentCallNet.toFixed(2)}\nRadar Activated.`);
+    // ── Firefight thresholds (70% profit = price at 30% of entry) ──
+    const callFirefightLevel = callSpreadEntryPremium * 0.30;
+    const putFirefightLevel  = putSpreadEntryPremium  * 0.30;
+
+    // ── Per-spread SL: 4× entry premium + booked firefight buffer ──
+    // Hard cap = half the spread distance (max possible loss on one leg)
+    const rawCallSL = (callSpreadEntryPremium * 4) + bufferPremium;
+    const rawPutSL  = (putSpreadEntryPremium  * 4) + bufferPremium;
+    const maxSpreadSL = spread / 2; // e.g. 75 for NIFTY, 250 for SENSEX
+    const callSL = Math.min(rawCallSL, maxSpreadSL);
+    const putSL  = Math.min(rawPutSL,  maxSpreadSL);
+
+    // ── Iron Butterfly SL: original Iron Condor total premium × 3 + buffer ──
+    const butterflySL = (totalEntryPremium * 3) + bufferPremium;
+
+    // ── Iron Condor max loss (gap — informational only, no auto-exit) ──
+    const icMaxLoss = spread - totalEntryPremium + bufferPremium;
+
+
+    // --- 🎯 FIREFIGHT BANNER: 70% profit on either spread ---
+    if (
+        !activeTrade.alertsSent.call70Decay &&
+        tradeType !== 'PUT_SPREAD' &&
+        currentCallNet > 0 &&
+        currentCallNet <= callFirefightLevel
+    ) {
+        sendCondorAlert(
+            `🟢 <b>FIREFIGHT BANNER: ${idx} CALL 70% PROFIT</b>\n` +
+            `Entry: ₹${callSpreadEntryPremium.toFixed(2)}\n` +
+            `Firefight Level (30%): ₹${callFirefightLevel.toFixed(2)}\n` +
+            `Current: ₹${currentCallNet.toFixed(2)}\n` +
+            `Radar Activated — scanning for inward roll.`
+        );
         activeTrade.alertsSent.call70Decay = true;
         stateChanged = true;
     }
 
-    if (!activeTrade.alertsSent.put70Decay && tradeType !== 'CALL_SPREAD' && currentPutNet > 0 && currentPutNet <= (putSpreadEntryPremium * 0.3)) {
-        sendCondorAlert(`🟢 <b>70% DECAY: ${idx} PUT</b>\nEntry: ₹${putSpreadEntryPremium.toFixed(2)}\nCurrent: ₹${currentPutNet.toFixed(2)}\nRadar Activated.`);
+    if (
+        !activeTrade.alertsSent.put70Decay &&
+        tradeType !== 'CALL_SPREAD' &&
+        currentPutNet > 0 &&
+        currentPutNet <= putFirefightLevel
+    ) {
+        sendCondorAlert(
+            `🟢 <b>FIREFIGHT BANNER: ${idx} PUT 70% PROFIT</b>\n` +
+            `Entry: ₹${putSpreadEntryPremium.toFixed(2)}\n` +
+            `Firefight Level (30%): ₹${putFirefightLevel.toFixed(2)}\n` +
+            `Current: ₹${currentPutNet.toFixed(2)}\n` +
+            `Radar Activated — scanning for inward roll.`
+        );
         activeTrade.alertsSent.put70Decay = true;
         stateChanged = true;
     }
 
-    // --- 🚨 DEFENSIVE RADAR TRIGGER ---
+    // --- ⚠️ IRON BUTTERFLY DEFENSE: spot reaches short strike ATM ---
     const callStrike = extractBaseSymbol(activeTrade.symbols.callSell)?.strike;
-    const putStrike = extractBaseSymbol(activeTrade.symbols.putSell)?.strike;
+    const putStrike  = extractBaseSymbol(activeTrade.symbols.putSell)?.strike;
 
     if (spotLTP && !isIronButterfly) {
         if (callStrike && spotLTP >= callStrike && !activeTrade.alertsSent.callDefense) {
-            sendCondorAlert(`⚠️ <b>DEFENSE ALERT: ${idx} CALL</b>\nSpot (${spotLTP}) has reached Short Strike (${callStrike}).\nScanning for Iron Butterfly conversion...`);
+            sendCondorAlert(
+                `⚠️ <b>IRON BUTTERFLY TRIGGER: ${idx} CALL ATM</b>\n` +
+                `Spot (${spotLTP}) reached Short Call Strike (${callStrike}).\n` +
+                `Scanning to roll PUT side to ATM → Iron Butterfly conversion...`
+            );
             activeTrade.alertsSent.callDefense = true;
             stateChanged = true;
         } else if (putStrike && spotLTP <= putStrike && !activeTrade.alertsSent.putDefense) {
-            sendCondorAlert(`⚠️ <b>DEFENSE ALERT: ${idx} PUT</b>\nSpot (${spotLTP}) has reached Short Strike (${putStrike}).\nScanning for Iron Butterfly conversion...`);
+            sendCondorAlert(
+                `⚠️ <b>IRON BUTTERFLY TRIGGER: ${idx} PUT ATM</b>\n` +
+                `Spot (${spotLTP}) reached Short Put Strike (${putStrike}).\n` +
+                `Scanning to roll CALL side to ATM → Iron Butterfly conversion...`
+            );
             activeTrade.alertsSent.putDefense = true;
             stateChanged = true;
         }
@@ -162,72 +270,132 @@ export const monitorCondorLevels = async () => {
 
     if (stateChanged) await activeTrade.save();
 
-    // --- 📡 RADAR SCANNER ---
-    if ((activeTrade.alertsSent.call70Decay || activeTrade.alertsSent.put70Decay || activeTrade.alertsSent.callDefense || activeTrade.alertsSent.putDefense) && !isIronButterfly && spotLTP) {
+    // --- 📡 RADAR SCANNER (throttled to every 5 seconds) ---
+    if (
+        (activeTrade.alertsSent.call70Decay  ||
+         activeTrade.alertsSent.put70Decay   ||
+         activeTrade.alertsSent.callDefense  ||
+         activeTrade.alertsSent.putDefense)  &&
+        !isIronButterfly && spotLTP
+    ) {
         if (Date.now() - lastScanTime > 5000) {
             lastScanTime = Date.now();
             await scanForRoll(activeTrade, spotLTP);
         }
     }
 
-    // --- 🚨 STOP LOSS LOGIC ---
+    // ──────────────────────────────────────────────────────────────────
+    // STOP LOSS EVALUATION
+    // ──────────────────────────────────────────────────────────────────
     let triggerExit = false;
-    let exitReason = '';
-    let slHitSide = null; // track which side hit SL for new trade creation
-
-    const currentTotalValue = currentCallNet + currentPutNet;
+    let exitReason  = '';
+    let slHitSide   = null;
+    let isFullExit  = false; // true = exit all 4 legs; false = exit 1 spread only
 
     if (isIronButterfly) {
-        // 🦋 IRON BUTTERFLY SL = totalEntryPremium * 3 + bufferPremium
-        // 4-leg exit together, so 3x on combined premium is the risk limit
-        const maxLossLimit = (totalEntryPremium * 3) + bufferPremium;
-
-        if (currentTotalValue >= maxLossLimit) {
+        // ── IRON BUTTERFLY SL ──
+        // Use original Iron Condor total entry premium (not butterfly roll premium)
+        const currentTotalValue = currentCallNet + currentPutNet;
+        if (currentTotalValue >= butterflySL) {
             triggerExit = true;
-            exitReason = `Iron Butterfly SL Hit (Limit: ₹${maxLossLimit.toFixed(2)} | Current: ₹${currentTotalValue.toFixed(2)})`;
+            isFullExit  = true;
+            exitReason  = `Iron Butterfly SL Hit (Limit: ₹${butterflySL.toFixed(2)} | Current: ₹${currentTotalValue.toFixed(2)})`;
         }
     } else {
-        // 🦅 STANDARD CONDOR: single side exit only, so 4x on that spread premium
-        const callSL = (callSpreadEntryPremium * 4) + bufferPremium;
-        const putSL  = (putSpreadEntryPremium  * 4) + bufferPremium;
+        // ── STANDARD CONDOR: per-spread SL ──
+        const currentSLCount = spreadSLCount || 0;
 
         if (tradeType !== 'PUT_SPREAD' && currentCallNet >= callSL) {
+            slHitSide  = 'CALL';
             triggerExit = true;
-            slHitSide = 'CALL';
-            exitReason = `CALL SL Hit (Current: ₹${currentCallNet.toFixed(2)} | Limit: ₹${callSL.toFixed(2)})`;
+            exitReason  = `CALL Spread SL Hit #${currentSLCount + 1} (Current: ₹${currentCallNet.toFixed(2)} | Limit: ₹${callSL.toFixed(2)})`;
+
+            // 2nd spread SL = exit everything (max loss scenario)
+            isFullExit = (currentSLCount + 1) >= 2;
+
         } else if (tradeType !== 'CALL_SPREAD' && currentPutNet >= putSL) {
+            slHitSide   = 'PUT';
             triggerExit = true;
-            slHitSide = 'PUT';
-            exitReason = `PUT SL Hit (Current: ₹${currentPutNet.toFixed(2)} | Limit: ₹${putSL.toFixed(2)})`;
+            exitReason  = `PUT Spread SL Hit #${currentSLCount + 1} (Current: ₹${currentPutNet.toFixed(2)} | Limit: ₹${putSL.toFixed(2)})`;
+
+            isFullExit = (currentSLCount + 1) >= 2;
         }
     }
 
+    // ── GAP PROTECTION ──
+    // If spot has blown through a short strike, max loss is capped by spread width.
+    // Suppress auto-exit — hold till expiry or manual close.
+    // (No automated exit logic changed — this is purely a suppression guard.)
+    if (triggerExit && spotLTP > 0) {
+        const callShortStr = extractBaseSymbol(activeTrade.symbols.callSell)?.strike;
+        const putShortStr  = extractBaseSymbol(activeTrade.symbols.putSell)?.strike;
+        const isGap = callShortStr && putShortStr &&
+            (spotLTP > callShortStr * 1.005 || spotLTP < putShortStr * 0.995);
+
+        if (isGap) {
+            if (!activeTrade.alertsSent?.gapAlert) {
+                const maxLoss = icMaxLoss;
+                sendCondorAlert(
+                    `⚡ <b>GAP SCENARIO — SL SUPPRESSED: ${idx}</b>\n` +
+                    `Spot ${spotLTP} breached short strike.\n` +
+                    `Max capped loss: ₹${(maxLoss * activeTrade.lotSize).toFixed(0)}\n` +
+                    `Formula: Spread(${spread}) - NetPremium(${totalEntryPremium.toFixed(2)}) + Buffer(${bufferPremium.toFixed(2)})\n` +
+                    `⏳ Holding position till expiry.`
+                );
+                activeTrade.alertsSent.gapAlert = true;
+                await activeTrade.save();
+            }
+            return; // suppress SL exit — strategy decision, no automated change
+        }
+    }
+
+    // ── EXECUTE EXIT ──
     if (triggerExit && activeTrade.status === 'ACTIVE') {
         activeTrade.status = 'EXITING';
-        await activeTrade.save();
-        sendCondorAlert(`🚨 <b>STOP LOSS TRIGGERED: ${idx}</b>\nReason: ${exitReason}\nExecuting margin-safe exit...`);
-        await executeMarketExit(activeTrade);
-
-        // Mark as COMPLETED after exit
-        activeTrade.status = 'COMPLETED';
-        activeTrade.slHitSide = slHitSide; // track for new trade creation
+        const currentSLCount = (activeTrade.spreadSLCount || 0) + 1;
+        activeTrade.spreadSLCount = currentSLCount;
         await activeTrade.save();
 
-        // Notify: if one side hit SL, alert to enter new spread on that side
-        if (slHitSide && tradeType === 'IRON_CONDOR') {
+        sendCondorAlert(
+            `🚨 <b>STOP LOSS TRIGGERED: ${idx}</b>\n` +
+            `Reason: ${exitReason}\n` +
+            `Exit Type: ${isFullExit ? '🔴 FULL EXIT (both spreads)' : '🟡 PARTIAL EXIT (one spread)'}\n` +
+            `Executing exit...`
+        );
+
+        await executeMarketExit(activeTrade, isFullExit ? 'FULL' : slHitSide);
+
+        if (isFullExit) {
+            // Both spreads exited — mark entire trade COMPLETED
+            activeTrade.status    = 'COMPLETED';
+            activeTrade.slHitSide = slHitSide;
+            await activeTrade.save();
+
             sendCondorAlert(
-                `📋 <b>SL Hit: ${slHitSide} Side</b>\n` +
-                `Other side still open.\n` +
-                `When you enter a new ${slHitSide} spread on Kite,\n` +
-                `the bot will auto-detect it as a NEW Iron Condor.\n` +
-                `Buffer will be loaded from MongoDB history.`
+                `🔴 <b>MAX LOSS HIT: ${idx} — Both Spreads Exited</b>\n` +
+                `Circle complete. New circle will begin on next Kite entry.\n` +
+                `Buffer will be recalculated from MongoDB history.`
+            );
+        } else {
+            // One spread exited — RESET: keep healthy side, await new spread entry
+            activeTrade.status    = 'COMPLETED';
+            activeTrade.slHitSide = slHitSide;
+            await activeTrade.save();
+
+            sendCondorAlert(
+                `🟡 <b>RESET: ${idx} — ${slHitSide} Spread Exited (SL #${currentSLCount})</b>\n` +
+                `Healthy side remains open.\n` +
+                `When you enter a new ${slHitSide} spread on Kite, the bot will detect it\n` +
+                `and reload buffer from MongoDB (circle-aware).\n` +
+                `⚠️ Next SL on either side = FULL EXIT.`
             );
         }
     }
 };
 
+
 // ==========================================
-// 📡 3. THE ROLL SCANNER (RADAR)
+// 📡 4. ROLL SCANNER (RADAR)
 // ==========================================
 export const scanForRoll = async (trade, liveSpotPrice) => {
     try {
@@ -235,27 +403,29 @@ export const scanForRoll = async (trade, liveSpotPrice) => {
         if (!io || !liveSpotPrice) return;
 
         const isNifty = trade.index === 'NIFTY';
-        const spreadDistance = isNifty
-            ? parseInt(process.env.NIFTY_SPREAD_DISTANCE || 150)
-            : parseInt(process.env.SENSEX_SPREAD_DISTANCE || 500);
+        const spreadDistance = getSpreadDistance(trade.index);
 
         let suggestedRoll = null;
         const baseSymbolInfoCall = extractBaseSymbol(trade.symbols.callSell);
         const baseSymbolInfoPut  = extractBaseSymbol(trade.symbols.putSell);
 
-        // 🦋 MODE 1: DEFENSE (IRON BUTTERFLY CONVERSION)
+        // 🦋 MODE 1: DEFENSE — Iron Butterfly conversion
+        // Roll the healthy side to the ATM short strike of the breached side
         if (trade.alertsSent.callDefense || trade.alertsSent.putDefense) {
-            const sideToRoll = trade.alertsSent.callDefense ? 'PE' : 'CE';
-            const targetShortStrike = trade.alertsSent.callDefense ? baseSymbolInfoCall.strike : baseSymbolInfoPut.strike;
-            const targetLongStrike  = sideToRoll === 'PE' ? targetShortStrike - spreadDistance : targetShortStrike + spreadDistance;
+            const sideToRoll       = trade.alertsSent.callDefense ? 'PE' : 'CE';
+            const targetShortStrike = trade.alertsSent.callDefense
+                ? baseSymbolInfoCall.strike
+                : baseSymbolInfoPut.strike;
+            const targetLongStrike  = sideToRoll === 'PE'
+                ? targetShortStrike - spreadDistance
+                : targetShortStrike + spreadDistance;
 
-            const base     = baseSymbolInfoCall.base;
-            const sellKite = `${base}${targetShortStrike}${sideToRoll}`;
-            const buyKite  = `${base}${targetLongStrike}${sideToRoll}`;
+            const base       = baseSymbolInfoCall.base;
+            const sellKite   = `${base}${targetShortStrike}${sideToRoll}`;
+            const buyKite    = `${base}${targetLongStrike}${sideToRoll}`;
             const sellUpstox = kiteToUpstoxSymbol(sellKite, trade.index);
-            const buyUpstox  = kiteToUpstoxSymbol(buyKite, trade.index);
+            const buyUpstox  = kiteToUpstoxSymbol(buyKite,  trade.index);
 
-            // Use Upstox LTP (returns { 'NSE_FO|...': { last_price: N }, ... })
             const quotes = await getLTP([sellUpstox, buyUpstox]);
             let netPremium = 0;
             if (quotes) {
@@ -273,34 +443,46 @@ export const scanForRoll = async (trade, liveSpotPrice) => {
             };
         }
 
-        // 🦅 MODE 2: OFFENSE (70% DECAY ROLL INWARD)
+        // 🦅 MODE 2: OFFENSE — Firefight inward roll (70% decay)
+        // Scan up to 5 strikes inward looking for a net premium
+        // within ±1 pt of the opposite spread's entry premium
         else if (trade.alertsSent.call70Decay || trade.alertsSent.put70Decay) {
-            const sideToRoll      = trade.alertsSent.call70Decay ? 'CE' : 'PE';
-            const targetPremium   = trade.alertsSent.call70Decay ? trade.putSpreadEntryPremium : trade.callSpreadEntryPremium;
-            const currentShortStrike  = sideToRoll === 'CE' ? baseSymbolInfoCall.strike : baseSymbolInfoPut.strike;
-            const oppositeShortStrike = sideToRoll === 'CE' ? baseSymbolInfoPut.strike  : baseSymbolInfoCall.strike;
+            const sideToRoll          = trade.alertsSent.call70Decay ? 'CE' : 'PE';
+            const targetPremium       = trade.alertsSent.call70Decay
+                ? trade.putSpreadEntryPremium
+                : trade.callSpreadEntryPremium;
+            const currentShortStrike  = sideToRoll === 'CE'
+                ? baseSymbolInfoCall.strike
+                : baseSymbolInfoPut.strike;
+            const oppositeShortStrike = sideToRoll === 'CE'
+                ? baseSymbolInfoPut.strike
+                : baseSymbolInfoCall.strike;
             const base     = baseSymbolInfoCall.base;
             const stepSize = isNifty ? 50 : 100;
 
             const strikesToScan = [];
             for (let i = 1; i <= 5; i++) {
-                let scanShort = sideToRoll === 'CE' ? currentShortStrike - (i * stepSize) : currentShortStrike + (i * stepSize);
-                let scanLong  = sideToRoll === 'CE' ? scanShort + spreadDistance : scanShort - spreadDistance;
+                let scanShort = sideToRoll === 'CE'
+                    ? currentShortStrike - (i * stepSize)
+                    : currentShortStrike + (i * stepSize);
+                let scanLong = sideToRoll === 'CE'
+                    ? scanShort + spreadDistance
+                    : scanShort - spreadDistance;
 
                 if (sideToRoll === 'CE' && scanShort < oppositeShortStrike) break;
                 if (sideToRoll === 'PE' && scanShort > oppositeShortStrike) break;
 
                 strikesToScan.push({
-                    sellKite:    `${base}${scanShort}${sideToRoll}`,
-                    buyKite:     `${base}${scanLong}${sideToRoll}`,
-                    sellUpstox:  kiteToUpstoxSymbol(`${base}${scanShort}${sideToRoll}`, trade.index),
-                    buyUpstox:   kiteToUpstoxSymbol(`${base}${scanLong}${sideToRoll}`,  trade.index),
+                    sellKite:   `${base}${scanShort}${sideToRoll}`,
+                    buyKite:    `${base}${scanLong}${sideToRoll}`,
+                    sellUpstox: kiteToUpstoxSymbol(`${base}${scanShort}${sideToRoll}`, trade.index),
+                    buyUpstox:  kiteToUpstoxSymbol(`${base}${scanLong}${sideToRoll}`,  trade.index),
                 });
             }
 
             if (strikesToScan.length > 0) {
                 const allSymbols = strikesToScan.flatMap(s => [s.sellUpstox, s.buyUpstox]);
-                const quotes = await getLTP(allSymbols);
+                const quotes     = await getLTP(allSymbols);
 
                 if (quotes) {
                     for (const pair of strikesToScan) {
@@ -326,14 +508,23 @@ export const scanForRoll = async (trade, liveSpotPrice) => {
         if (suggestedRoll) io.emit('roll_suggestion', suggestedRoll);
 
     } catch (err) {
-        emitLog(`❌ Roll Radar Error:: ${err.message}`, "error");
+        emitLog(`❌ Roll Radar Error: ${err.message}`, "error");
     }
 };
 
+
 // ==========================================
-// 🔄 4. KITE POSITION SYNC MANAGER
-// Creates NEW ActiveTrade when new positions detected after a COMPLETED trade
-// Loads buffer from MongoDB history (cross-day aware)
+// 🔄 5. KITE POSITION SYNC MANAGER
+//
+// CIRCLE / RESET AWARENESS
+// ────────────────────────
+// After a RESET (one spread SL hit), the COMPLETED trade has spreadSLCount = 1.
+// When Kite detects new positions, scanAndSyncOrders calls fetchHistoricalBuffer
+// which walks MongoDB and correctly identifies which circle we are in and
+// what buffer exists from this cycle's prior profits.
+//
+// Full exit (spreadSLCount = 2 or Iron Butterfly SL) → circle is over.
+// The next new positions start Circle N+1 with a fresh buffer scan.
 // ==========================================
 export const scanAndSyncOrders = async () => {
     const index = getActiveIndexForToday();
@@ -341,8 +532,8 @@ export const scanAndSyncOrders = async () => {
 
     const kc = getKiteInstance();
     try {
-        const positions = await kc.getPositions();
-        let activeTrade = await ActiveTrade().findOne({ index, status: 'ACTIVE' });
+        const positions  = await kc.getPositions();
+        let activeTrade  = await ActiveTrade().findOne({ index, status: 'ACTIVE' });
 
         const activeIndexPositions = positions.net.filter(
             p => p.tradingsymbol.startsWith(index) && p.quantity !== 0
@@ -357,22 +548,26 @@ export const scanAndSyncOrders = async () => {
 
             try {
                 await TradePerformance().create({
-                    strategy: 'IRON_CONDOR',
-                    index: index,
+                    strategy:      'IRON_CONDOR',
+                    index,
                     activeTradeId: activeTrade._id,
-                    exitReason: totalPnL >= 0 ? 'PROFIT_TARGET' : 'STOP_LOSS_HIT',
-                    realizedPnL: totalPnL,
+                    exitReason:    totalPnL >= 0 ? 'PROFIT_TARGET' : 'STOP_LOSS_HIT',
+                    realizedPnL:   totalPnL,
+                    // firefightBookedPnL should be set separately during a firefight roll exit
                     notes: `Strategy: Iron Condor/Butterfly | Final P&L: ₹${totalPnL.toFixed(2)}`
                 });
             } catch (dbErr) {
-                emitLog(`❌ History Archive Error:: ${dbErr.message}`, "error");
+                emitLog(`❌ History Archive Error: ${dbErr.message}`, "error");
             }
 
-            activeTrade.status = 'COMPLETED';
+            activeTrade.status   = 'COMPLETED';
             activeTrade.exitTime = new Date();
             await activeTrade.save();
 
-            sendCondorAlert(`🏁 <b>Trade Completed: ${index}</b>\nTotal P&L: <b>₹${totalPnL.toLocaleString('en-IN')}</b>`);
+            sendCondorAlert(
+                `🏁 <b>Trade Completed: ${index}</b>\n` +
+                `Total P&L: <b>₹${totalPnL.toLocaleString('en-IN')}</b>`
+            );
             return;
         }
 
@@ -396,56 +591,62 @@ export const scanAndSyncOrders = async () => {
             if (callStrike === putStrike) isButterflyNow = true;
         }
 
-        const tradeType  = (ceSell && peSell) ? 'IRON_CONDOR' : ceSell ? 'CALL_SPREAD' : 'PUT_SPREAD';
-        const callNet    = ceSell && ceBuy ? Math.abs(ceSell.average_price - ceBuy.average_price) : 0;
-        const putNet     = peSell && peBuy ? Math.abs(peSell.average_price - peBuy.average_price) : 0;
-        const lotSize    = Math.abs(ceSell?.quantity || peSell?.quantity || 65);
-        const spotToken  = 256265; // NIFTY spot token (default)
+        const tradeType = (ceSell && peSell) ? 'IRON_CONDOR' : ceSell ? 'CALL_SPREAD' : 'PUT_SPREAD';
+        const callNet   = ceSell && ceBuy ? Math.abs(ceSell.average_price - ceBuy.average_price) : 0;
+        const putNet    = peSell && peBuy ? Math.abs(peSell.average_price - peBuy.average_price) : 0;
+        const lotSize   = Math.abs(ceSell?.quantity || peSell?.quantity || 65);
+        const spotToken = 256265;
 
-        // ================================================================
-        // 🆕 NEW TRADE CREATION
-        // Fires when:
-        //   A) No activeTrade exists at all, OR
-        //   B) Previous trade is COMPLETED and new positions detected
-        //      (e.g. you entered a new spread after an SL hit)
-        // Buffer is loaded from MongoDB history so cross-day profits count
-        // ================================================================
-        const lastTrade = await ActiveTrade().findOne({ index }).sort({ createdAt: -1 });
+        // ── NEW TRADE CREATION ──
+        // Fires when no ACTIVE trade exists and positions are detected.
+        // Fetches historical buffer from MongoDB (circle-aware).
+        const lastTrade    = await ActiveTrade().findOne({ index }).sort({ createdAt: -1 });
         const shouldCreateNew = !activeTrade && activeIndexPositions.length > 0 &&
             (!lastTrade || lastTrade.status === 'COMPLETED');
 
         if (shouldCreateNew) {
             emitLog(`🆕 New positions detected for ${index}. Creating new ActiveTrade...`, "info");
 
-            // Load buffer from MongoDB — includes all previous PROFIT_TARGET trades
-            const historicalBuffer = await fetchHistoricalBuffer(index, lotSize);
+            const { bufferPoints: historicalBuffer, circleNumber } =
+                await fetchHistoricalBuffer(index, lotSize);
 
-            // Also add today's intraday closed PnL (e.g. from the rolled/closed leg today)
+            // Today's intraday closed PnL (rolls, partial exits today)
             const todayClosedPnL = positions.net
-                .filter(p => p.tradingsymbol.startsWith(index) && p.quantity === 0 &&
-                    (p.day_buy_quantity > 0 || p.day_sell_quantity > 0))
+                .filter(p =>
+                    p.tradingsymbol.startsWith(index) &&
+                    p.quantity === 0 &&
+                    (p.day_buy_quantity > 0 || p.day_sell_quantity > 0)
+                )
                 .reduce((sum, p) => sum + (p.realised || p.pnl || 0), 0);
             const todayBuffer = Math.max(0, todayClosedPnL / lotSize);
 
-            // Total buffer = historical (from MongoDB) + today's intraday booked profit
             const totalBuffer = historicalBuffer + todayBuffer;
 
-            emitLog(`📊 Buffer breakdown: Historical=${historicalBuffer.toFixed(2)} + Today=${todayBuffer.toFixed(2)} = Total=${totalBuffer.toFixed(2)}`, "info");
+            emitLog(
+                `📊 Buffer breakdown [Circle #${circleNumber}]: ` +
+                `Historical=${historicalBuffer.toFixed(2)} + Today=${todayBuffer.toFixed(2)} = Total=${totalBuffer.toFixed(2)}`,
+                "info"
+            );
 
             const newTrade = await ActiveTrade().create({
                 index,
-                status: 'ACTIVE',
+                status:          'ACTIVE',
                 tradeType,
                 isIronButterfly: isButterflyNow,
-                bufferPremium: totalBuffer,
+                bufferPremium:   totalBuffer,
+                spreadSLCount:   0,           // tracks how many spread SLs hit this circle
+                circleNumber,
                 lotSize,
                 callSpreadEntryPremium: callNet,
                 putSpreadEntryPremium:  putNet,
-                totalEntryPremium: callNet + putNet,
+                totalEntryPremium:      callNet + putNet,
                 alertsSent: {
-                    call70Decay: false,
-                    put70Decay: false,
-                    firefightAlert: false
+                    call70Decay:   false,
+                    put70Decay:    false,
+                    callDefense:   false,
+                    putDefense:    false,
+                    firefightAlert: false,
+                    gapAlert:      false,
                 },
                 symbols: {
                     callSell: ceSell?.tradingsymbol || null,
@@ -453,18 +654,17 @@ export const scanAndSyncOrders = async () => {
                     putSell:  peSell?.tradingsymbol || null,
                     putBuy:   peBuy?.tradingsymbol  || null,
                 },
-                tokens: {
-                    spotIndex: spotToken,
-                }
+                tokens: { spotIndex: spotToken }
             });
 
-            emitLog(`✅ New ActiveTrade created: ${newTrade._id}`, "info");
+            emitLog(`✅ New ActiveTrade created: ${newTrade._id} [Circle #${circleNumber}]`, "info");
             sendCondorAlert(
-                `🆕 <b>New Iron Condor Detected: ${index}</b>\n` +
+                `🆕 <b>New Iron Condor Detected: ${index} [Circle #${circleNumber}]</b>\n` +
                 `Type: ${tradeType}\n` +
-                `Call Spread: ₹${callNet.toFixed(2)}\n` +
-                `Put Spread: ₹${putNet.toFixed(2)}\n` +
-                `Buffer (from history): ${totalBuffer.toFixed(2)} pts\n` +
+                `Call Spread Entry: ₹${callNet.toFixed(2)}\n` +
+                `Put Spread Entry:  ₹${putNet.toFixed(2)}\n` +
+                `Total IC Premium:  ₹${(callNet + putNet).toFixed(2)}\n` +
+                `Buffer (history + today): ${totalBuffer.toFixed(2)} pts\n` +
                 `Butterfly: ${isButterflyNow ? 'YES 🦋' : 'NO'}`
             );
             return;
@@ -477,19 +677,22 @@ export const scanAndSyncOrders = async () => {
                 activeTrade.isIronButterfly  !== isButterflyNow;
 
             if (needsUpdate) {
-                // Today's intraday realized PnL from closed legs (rolls etc.)
                 const todayClosedPnL = positions.net
-                    .filter(p => p.tradingsymbol.startsWith(index) && p.quantity === 0 &&
-                        (p.day_buy_quantity > 0 || p.day_sell_quantity > 0))
+                    .filter(p =>
+                        p.tradingsymbol.startsWith(index) &&
+                        p.quantity === 0 &&
+                        (p.day_buy_quantity > 0 || p.day_sell_quantity > 0)
+                    )
                     .reduce((sum, p) => sum + (p.realised || p.pnl || 0), 0);
 
-                // Buffer = intraday booked profit only (historical already baked in at creation)
-                activeTrade.bufferPremium      = Math.max(0, todayClosedPnL / lotSize);
-                activeTrade.tradeType          = tradeType;
-                activeTrade.isIronButterfly    = isButterflyNow;
+                // Only intraday booked profit added here — historical already baked in at creation
+                activeTrade.bufferPremium          = Math.max(0, todayClosedPnL / lotSize);
+                activeTrade.tradeType              = tradeType;
+                activeTrade.isIronButterfly        = isButterflyNow;
                 activeTrade.callSpreadEntryPremium = callNet || activeTrade.callSpreadEntryPremium;
                 activeTrade.putSpreadEntryPremium  = putNet  || activeTrade.putSpreadEntryPremium;
-                activeTrade.totalEntryPremium  = activeTrade.callSpreadEntryPremium + activeTrade.putSpreadEntryPremium;
+                activeTrade.totalEntryPremium      =
+                    activeTrade.callSpreadEntryPremium + activeTrade.putSpreadEntryPremium;
                 activeTrade.symbols = {
                     callSell: ceSell?.tradingsymbol || null,
                     callBuy:  ceBuy?.tradingsymbol  || null,
@@ -507,6 +710,6 @@ export const scanAndSyncOrders = async () => {
         }
 
     } catch (err) {
-        emitLog(`❌ Order Monitor Sync Error:: ${err.message}`, "error");
+        emitLog(`❌ Order Monitor Sync Error: ${err.message}`, "error");
     }
 };
